@@ -216,7 +216,7 @@ pip install onnx onnxruntime
 
 ```bash
 # 克隆项目
-git clone <repository-url>
+git clone https://github.com/fangzhaoyang-max/digital-life.git
 cd digital-life
 
 # 安装依赖
@@ -238,13 +238,13 @@ python digital-life1.9.py
 
 ```
 digital-life/
-├── digital-life1.9.py          # 最新版本主程序
+├── digital-life1.9.py          # 最新版本主程序(建议运行)
 ├── digital-life1.0-1.8.py      # 历史版本
-├── Digital Prokaryote 1.0.py   # 原核细胞版本
+├── Digital Prokaryote 1.0.py   # 原核细胞版本(数字生命的升级版，未完成)
 ├── 上帝.py                      # 创世程序
-├── 亚当.py                      # 第一个数字生命
-├── 夏娃.py                      # 第二个数字生命
-├── 蜂群.py                      # 群体智能版本
+├── 亚当.py                      # 第一个原始数字生命
+├── 夏娃.py                      # 第二个原始数字生命
+├── 蜂群.py                      # 变种版本
 ├── README.md                    # 基础说明
 ├── NEW_README.md               # 详细说明（本文件）
 ├── digital_life_bilingual_paper.md.md  # 技术论文
