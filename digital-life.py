@@ -734,7 +734,7 @@ class NeuralASTTransformer(ast.NodeTransformer):
         return node
 
     def _mutate_assignment(self, node):
-        if len(node.targets) == 1 and isinstance(node.value, (ast.Num, ast.Constant)):
+        if len(node.targets) == 1 and isinstance(node.value, ast.Constant):
             new_value = ast.BinOp(
                 left=node.value,
                 op=ast.Add(),
@@ -937,7 +937,7 @@ class Block:
 
 
 class DistributedLedger:
-    """为数字生命定制的区块链系统"""
+    """为数字生命定制的区块链系统（支持同机目录聚合发现）"""
 
     def __init__(self, node_id: str, genesis: bool = False, difficulty: int = 2):
         self.chain: List[Block] = []
@@ -947,6 +947,11 @@ class DistributedLedger:
         self._lock = threading.RLock()
 
         os.makedirs('chaindata', exist_ok=True)
+
+        # 目录聚合缓存（解决“不能发现其他相同程序”的问题）
+        self._dir_cache_active: Set[str] = set()
+        self._dir_cache_addr: Dict[str, Tuple[str, int, str]] = {}
+        self._dir_cache_ts: float = 0.0
 
         loaded = self.load_chain()
         if genesis or not loaded:
@@ -1117,10 +1122,77 @@ class DistributedLedger:
         }
         self.add_block(data)
 
+    def _scan_directory(self, ttl: float = 5.0) -> Tuple[Set[str], Dict[str, Tuple[str, int, str]]]:
+        """
+        扫描本机 chaindata 目录，聚合所有节点的活跃ID与地址公告。
+        解决“无法发现其他相同程序”：不同进程写入各自链文件，这里统一汇聚视图。
+        """
+        with self._lock:
+            now = time.time()
+            if (now - self._dir_cache_ts) < ttl and self._dir_cache_addr:
+                return set(self._dir_cache_active), dict(self._dir_cache_addr)
+
+            active_nodes: Set[str] = set()
+            dead_nodes: Set[str] = set()
+            addr_map: Dict[str, Tuple[str, int, str]] = {}
+            addr_ts: Dict[str, float] = {}
+
+            try:
+                for fn in os.listdir('chaindata'):
+                    if not fn.endswith('_chain.pkl'):
+                        continue
+                    path = os.path.join('chaindata', fn)
+                    try:
+                        with open(path, 'rb') as f:
+                            chain_data = pickle.load(f)  # List[Dict]
+                    except Exception:
+                        continue
+                    for item in chain_data:
+                        data = item.get('data', {})
+                        bts = float(item.get('timestamp', data.get('timestamp', 0.0)) or 0.0)
+                        t = data.get('type', '')
+                        if t in ('gene_transfer', 'announce', 'discovery'):
+                            nid = data.get('sender') or data.get('node_id')
+                            if nid:
+                                active_nodes.add(nid)
+                        elif t == 'language':
+                            nid = data.get('node_id')
+                            pid = data.get('peer_id')
+                            if nid:
+                                active_nodes.add(nid)
+                            if pid:
+                                active_nodes.add(pid)
+                        elif t == 'death':
+                            nid = data.get('node_id')
+                            if nid:
+                                dead_nodes.add(nid)
+                        if t == 'announce':
+                            nid = data.get('node_id')
+                            host = data.get('host')
+                            try:
+                                port = int(data.get('port', 0))
+                            except Exception:
+                                port = 0
+                            pub = data.get('pubkey', '')
+                            if nid and host and 1 <= port <= 65535:
+                                prev = addr_ts.get(nid, -1.0)
+                                if bts >= prev:
+                                    addr_ts[nid] = bts
+                                    addr_map[nid] = (host, port, pub)
+            except Exception as e:
+                logger.debug(f"Directory scan failed: {str(e)[:200]}")
+
+            active_nodes.difference_update(dead_nodes)
+            self._dir_cache_active = active_nodes
+            self._dir_cache_addr = addr_map
+            self._dir_cache_ts = time.time()
+            return set(active_nodes), dict(addr_map)
+
     def get_active_nodes(self) -> List[str]:
-        """从区块链获取当前活跃节点列表（修复：计入 language.peer_id）"""
+        """从区块链获取当前活跃节点列表（聚合本地链与目录中其他链）"""
         with self._lock:
             active_nodes = set()
+            dead_nodes = set()
             for block in self.chain:
                 data = block.data
                 t = data.get('type')
@@ -1137,18 +1209,20 @@ class DistributedLedger:
                         active_nodes.add(pid)
                 elif t == 'death':
                     if data.get('node_id'):
-                        active_nodes.discard(data['node_id'])
-            return list(active_nodes)
+                        dead_nodes.add(data['node_id'])
+
+            active_nodes.difference_update(dead_nodes)
+
+        ext_active, _ = self._scan_directory(ttl=3.0)
+        return list(active_nodes.union(ext_active))
 
     def get_node_address_map(self) -> Dict[str, Tuple[str, int, str]]:
-        """获取节点 -> (host, port, pubkey_hex) 映射（以最新公告为准）"""
-        with self._lock:
-            addr: Dict[str, Tuple[str, int, str]] = {}
-            for b in self.chain:
-                d = b.data
-                if d.get('type') == 'announce':
-                    addr[d['node_id']] = (d['host'], d['port'], d.get('pubkey', ''))
-            return addr
+        """
+        获取节点 -> (host, port, pubkey_hex) 映射（聚合视图，以最新公告为准）
+        优先从目录聚合缓存获取，自动更新。
+        """
+        _, addr_map = self._scan_directory(ttl=3.0)
+        return addr_map
 
 
 class CodeEvolutionEngine:
@@ -1246,7 +1320,7 @@ class CodeEvolutionEngine:
 
     def _mutate_data_flow_value(self, node: ast.AST, delta: int) -> ast.AST:
         if isinstance(node, ast.Assign):
-            if isinstance(node.value, (ast.Num, ast.Constant)) and isinstance(getattr(node, 'targets', [None])[0], ast.Name):
+            if isinstance(node.value, ast.Constant) and isinstance(getattr(node, 'targets', [None])[0], ast.Name):
                 try:
                     node.value = ast.BinOp(left=node.value, op=ast.Add(), right=ast.Constant(value=int(delta)))
                 except Exception:
@@ -1750,6 +1824,8 @@ class CodeEvolutionEngine:
             self.owner.config['sandbox_timeout_ms'] = int(_clamp(to, 200, 3000))
         except Exception:
             pass
+
+
 class DigitalEnvironment:
     """数字环境模拟器（支持真实主机感知：CPU/内存/网络吞吐，降级为随机模拟）"""
 
@@ -2433,8 +2509,9 @@ class TrueDigitalLife:
             'max_replication_per_hour': 2,
             'sandbox_timeout_ms': 800,
             'max_payload_bytes': 1 * 1024 * 1024,
-            'strict_target_ip_check': True,  # 仅发送到公共IP
-            'network_enable': True,          # 新增：允许外联请求的总开关（兼容无网络环境）
+            'strict_target_ip_check': True,   # 默认严格校验
+            'local_discovery_enable': True,   # 允许本机/内网发现和通信（修复同机发现）
+            'network_enable': True,           # 允许外联请求的总开关（兼容无网络环境）
             # 语言/协议/元学习配置
             'language_talk_prob': 0.15,
             'language_culture_drift_prob': 0.01,
@@ -2472,7 +2549,8 @@ class TrueDigitalLife:
         self.consciousness_level = 0.0
         self.is_alive = True
         self.energy = 100.0
-        self.metabolism = 1.0
+        our_metab = self.config.get('metabolism') if 'metabolism' in self.config else None
+        self.metabolism = float(our_metab) if our_metab is not None else 1.0
         self.age = 0
         self.pleasure = 0.5  # 愉悦度
         self.stress = 0.2    # 紧张度
@@ -2484,6 +2562,7 @@ class TrueDigitalLife:
 
         # 网络可达性调整（离线环境将保持 127.0.0.1）
         self._auto_detect_host()
+        # 修正端口选择：在 0.0.0.0 上扫描，避免误判；后续若冲突会在 _run_api 中重试
         self.config['port'] = self._find_free_port(self.config['port'], self.config['port'] + 200)
 
         self.blockchain = DistributedLedger(
@@ -2546,7 +2625,7 @@ class TrueDigitalLife:
         self.api_thread = threading.Thread(target=self._run_api, daemon=True)
         self.api_thread.start()
 
-        # 公告节点地址与公钥（仅写链，不外联）
+        # 公告节点地址与公钥（初次写链，不外联）
         try:
             self.blockchain.record_announce(self.node_id, self.config['host'], self.config['port'], self._pubkey_hex)
         except Exception as e:
@@ -2577,12 +2656,23 @@ class TrueDigitalLife:
 
     @staticmethod
     def _is_port_free(port: int, host: str = '0.0.0.0') -> bool:
+        """
+        更严格的端口占用检查：
+        - 不使用 SO_REUSEADDR（避免 Windows 误判）
+        - 若支持，启用 SO_EXCLUSIVEADDRUSE（Windows 独占）
+        - 调用 listen 建立占用关系后再关闭，最大限度降低“虚空闲”概率
+        """
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
+            if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                except Exception:
+                    pass
             s.bind((host, port))
+            s.listen(1)
             return True
-        except Exception:
+        except OSError:
             return False
         finally:
             try:
@@ -2591,8 +2681,9 @@ class TrueDigitalLife:
                 pass
 
     def _find_free_port(self, start: int, end: int) -> int:
+        # 使用通配地址检测，避免多网卡/不同绑定地址导致的误判
         for p in range(start, end + 1):
-            if self._is_port_free(p, self.config.get('host', '0.0.0.0')):
+            if self._is_port_free(p, '0.0.0.0'):
                 return p
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2674,7 +2765,6 @@ class TrueDigitalLife:
 
             try:
                 tn = TinyNet()
-                example = torch.randn(1, 16)
                 gm = fx.symbolic_trace(tn)
                 base['torch_fx'] = {'module': tn, 'graph': gm}
             except Exception:
@@ -2794,7 +2884,7 @@ class TrueDigitalLife:
                     host = data.get('metadata', {}).get('host') or request.remote_addr
                     port = int(data.get('metadata', {}).get('port', 0))
                     if 1 <= port <= 65535:
-                        if (not self.config.get('strict_target_ip_check')) or self._is_public_destination(host):
+                        if self._is_allowed_destination(host):
                             try:
                                 self.blockchain.record_announce(source_node, host, port, pubkey_hex)
                                 logger.info(f"Auto-registered announce for {source_node} at {host}:{port}")
@@ -2839,7 +2929,7 @@ class TrueDigitalLife:
                     host = data.get('meta', {}).get('host') or request.remote_addr
                     port = int(data.get('meta', {}).get('port', 0))
                     if 1 <= port <= 65535:
-                        if (not self.config.get('strict_target_ip_check')) or self._is_public_destination(host):
+                        if self._is_allowed_destination(host):
                             try:
                                 self.blockchain.record_announce(source_node, host, port, pub_hex)
                                 logger.info(f"Auto-registered announce for {source_node} at {host}:{port}")
@@ -2880,10 +2970,24 @@ class TrueDigitalLife:
             })
 
     def _run_api(self):
-        """运行分布式API服务器"""
+        """运行分布式API服务器（端口占用重试 + 重新公告）"""
         try:
             logger.info(f"API server starting on {self.config['host']}:{self.config['port']} (token head: {self.config['auth_token'][:6]}**)")
             self.api.run(host=self.config['host'], port=self.config['port'], debug=False, threaded=True, use_reloader=False)
+        except OSError as e:
+            msg = str(e).lower()
+            if 'address already in use' in msg or '10048' in msg or '98' in msg:
+                new_port = self._find_free_port(self.config['port'] + 1, self.config['port'] + 200)
+                logger.warning(f"Port {self.config['port']} busy, retry on {new_port}")
+                self.config['port'] = new_port
+                try:
+                    # 重新公告新的端口
+                    self.blockchain.record_announce(self.node_id, self.config['host'], self.config['port'], self._pubkey_hex)
+                except Exception:
+                    pass
+                self.api.run(host=self.config['host'], port=new_port, debug=False, threaded=True, use_reloader=False)
+            else:
+                logger.error(f"API server failed: {e}")
         except Exception as e:
             logger.error(f"API server failed: {e}")
 
@@ -3271,7 +3375,7 @@ class TrueDigitalLife:
         }
 
     def _find_replication_targets(self) -> List[str]:
-        """寻找适合的复制目标节点"""
+        """寻找适合的复制目标节点（使用目录聚合视图）"""
         active_nodes = set(self.blockchain.get_active_nodes())
         candidates = [
             n for n in active_nodes
@@ -3300,6 +3404,34 @@ class TrueDigitalLife:
         except Exception:
             return False
 
+    def _is_local_address(self, host: str) -> bool:
+        """判断是否为本机/内网地址（允许同机/内网发现）"""
+        try:
+            infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+            addrs = {info[4][0] for info in infos}
+            if not addrs:
+                return False
+            for ip in addrs:
+                ip_obj = ipaddress.ip_address(ip)
+                if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _is_allowed_destination(self, host: str) -> bool:
+        """
+        严格模式下允许公共地址；若开启 local_discovery_enable，则允许本机/内网地址。
+        若 strict_target_ip_check=False，则全部允许（开发模式）。
+        """
+        if not self.config.get('strict_target_ip_check', True):
+            return True
+        if self._is_public_destination(host):
+            return True
+        if self.config.get('local_discovery_enable', True) and self._is_local_address(host):
+            return True
+        return False
+
     def _send_replication_package(self, target_node: str, package: Dict) -> bool:
         """发送复制包到目标节点（只使用签名端点）"""
         if not self.config.get('network_enable', True):
@@ -3311,10 +3443,9 @@ class TrueDigitalLife:
             host, port, _pub = addr_map[target_node]
             base = f"http://{host}:{port}"
 
-            if self.config.get('strict_target_ip_check'):
-                if not self._is_public_destination(host):
-                    logger.warning(f"Skip non-public target address: {host}")
-                    return False
+            if not self._is_allowed_destination(host):
+                logger.warning(f"Skip disallowed target address: {host}")
+                return False
 
             try:
                 response2 = requests.post(
@@ -3357,7 +3488,7 @@ class TrueDigitalLife:
                 host = decrypted.get('metadata', {}).get('host', None)
                 port = int(decrypted.get('metadata', {}).get('port', 0))
                 if host and 1 <= port <= 65535:
-                    if (not self.config.get('strict_target_ip_check')) or self._is_public_destination(host):
+                    if self._is_allowed_destination(host):
                         try:
                             self.blockchain.record_announce(source_node, host, port, sender_pubkey_hex)
                             logger.info(f"Auto-registered announce for {source_node} at {host}:{port}")
@@ -3453,30 +3584,38 @@ class TrueDigitalLife:
                 last_seen = block.timestamp
                 break
         if last_seen == 0:
-            return 0.0
-        freshness = max(0.0, 1.0 - (time.time() - last_seen) / 3600.0)
+            # 尝试目录聚合中的最新公告时间
+            _, addr_map = self.blockchain._scan_directory(ttl=0)
+            if node_id in addr_map:
+                last_seen = time.time() - 60  # 估一个合理值
+        freshness = max(0.0, 1.0 - (time.time() - last_seen) / 3600.0) if last_seen else 0.2
         return random.uniform(0.5, 1.0) * freshness
 
     def _terminate(self):
-        """终止生命过程"""
-        self.state = LifeState.TERMINATED
+        """终止生命过程（幂等防护，避免重复终止）"""
+        if not self.is_alive:
+            return
         self.is_alive = False
+        self.state = LifeState.TERMINATED
         released_resources = {
             'energy': self.energy * 0.5,
             'knowledge': len(self.knowledge_base) * 0.1,
             'memory': len(self.short_term_memory) * 0.05 + len(self.long_term_memory) * 0.1
         }
-        self.environment.release_resources(released_resources)
-        self.blockchain.record_death(
-            self.node_id,
-            {
-                'final_energy': self.energy,
-                'final_consciousness': self.consciousness_level,
-                'age': self.age,
-                'code_versions': self.code_engine.code_versions,
-                'released_resources': released_resources
-            }
-        )
+        try:
+            self.environment.release_resources(released_resources)
+            self.blockchain.record_death(
+                self.node_id,
+                {
+                    'final_energy': self.energy,
+                    'final_consciousness': self.consciousness_level,
+                    'age': self.age,
+                    'code_versions': self.code_engine.code_versions,
+                    'released_resources': released_resources
+                }
+            )
+        except Exception:
+            pass
         logger.critical(f"Life terminated: {self.node_id}")
 
     def _network_maintenance(self):
@@ -3492,6 +3631,8 @@ class TrueDigitalLife:
                 if node not in addr_map:
                     continue
                 host, port, _ = addr_map[node]
+                if not self._is_allowed_destination(host):
+                    continue
                 url = f"http://{host}:{port}/ping"
                 resp = requests.get(url, timeout=2)
                 if resp.status_code != 200:
@@ -3613,7 +3754,7 @@ class TrueDigitalLife:
             if target not in addr_map:
                 return
             host, port, _ = addr_map[target]
-            if self.config.get('strict_target_ip_check') and not self._is_public_destination(host):
+            if not self._is_allowed_destination(host):
                 return
 
             ps = self.language._get_peer(target)
@@ -3687,7 +3828,7 @@ class TrueDigitalLife:
                 addr_map = self.blockchain.get_node_address_map()
                 if source in addr_map:
                     host, port, _ = addr_map[source]
-                    if not self.config.get('strict_target_ip_check') or self._is_public_destination(host):
+                    if self._is_allowed_destination(host):
                         pkg = self._create_signed_language_payload(reply)
                         url = f"http://{host}:{port}/speak_signed"
                         try:
