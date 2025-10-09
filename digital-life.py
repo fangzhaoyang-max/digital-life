@@ -1,4 +1,5 @@
 # 存在即证明---方兆阳
+
 import textwrap
 import ast
 import copy
@@ -32,40 +33,33 @@ from flask import Flask, jsonify, request
 from sklearn.neural_network import MLPClassifier
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from logging.handlers import RotatingFileHandler  # 新增：日志滚动
+from logging.handlers import RotatingFileHandler
 
 # 可选依赖：优雅降级
 try:
     import hypothesis as _hyp
     from hypothesis import strategies as _st, given as _given, settings as _hsettings
 except Exception:
-    _hyp = None
-    _st = None
-    _given = None
-    _hsettings = None
+    _hyp = _st = _given = _hsettings = None
 
 try:
     import torch
     from torch import nn
     import torch.fx as fx
 except Exception:
-    torch = None
-    nn = None
-    fx = None
+    torch = nn = fx = None
 
 try:
     import jax
     import jax.numpy as jnp
 except Exception:
-    jax = None
-    jnp = None
+    jax = jnp = None
 
 try:
     import onnx
     import onnxruntime as ort
 except Exception:
-    onnx = None
-    ort = None
+    onnx = ort = None
 
 try:
     import astor
@@ -80,7 +74,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        RotatingFileHandler('digital_life.log', maxBytes=5*1024*1024, backupCount=3),
+        RotatingFileHandler('digital_life.log', maxBytes=50 * 1024 * 1024, backupCount=3),
         logging.StreamHandler()
     ]
 )
@@ -92,9 +86,18 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+class LifeState(Enum):
+    ACTIVE = auto()
+    DORMANT = auto()
+    REPLICATING = auto()  # 新增复制状态
+    EVOLVING = auto()
+    TERMINATED = auto()
+
+
 # 量子增强模块
 class QuantumEnhancer:
     """为代码进化提供量子随机性支持"""
+
     def __init__(self):
         self.quantum_state = None
         self._init_quantum_entanglement()
@@ -135,6 +138,7 @@ class QuantumEnhancer:
 # 动态适应度评估系统（保留，用于被动场景）
 class DynamicFitnessEvaluator:
     """动态调整的适应度评估系统"""
+
     def __init__(self):
         self.metrics = {
             'functionality': 0.5,
@@ -223,9 +227,9 @@ class DynamicFitnessEvaluator:
 
 
 # ========== 多目标 + Pareto ==========
-
 class ParetoTools:
     """简单的非支配排序 + 拥挤度估计"""
+
     @staticmethod
     def non_dominated_sort(objs: List[Dict], maximize_keys: Set[str], minimize_keys: Set[str]) -> List[List[int]]:
         def dom(a, b):
@@ -300,6 +304,7 @@ class CorrectnessHarness:
     - 测试淘汰：对族群无区分度的测试被丢弃
     - 修复：评测调用增加超时保护，防止死循环/递归卡死
     """
+
     def __init__(self, owner: 'TrueDigitalLife'):
         self.owner = owner
         self.tests: Dict[str, List[Callable[[Any, Callable], bool]]] = {}
@@ -316,20 +321,24 @@ class CorrectnessHarness:
                 e0, a0 = obj.energy, obj.age
                 fn(obj)
                 return 0.0 <= obj.energy <= 100.0 and obj.age == a0 + 1
+
             def t2(obj, fn):
                 obj.energy = 1.0
                 fn(obj)
                 return 0.0 <= obj.energy <= 100.0
+
             gens += [t1, t2]
         elif method_name == '_environment_scan':
             def t1(obj, fn):
                 out = fn(obj)
                 return isinstance(out, dict) and 'resources' in out and 'threats' in out
+
             gens += [t1]
         elif method_name == '_survival_goal_evaluation':
             def t1(obj, fn):
                 s = fn(obj)
                 return isinstance(s, (int, float)) and not (s != s)  # not NaN
+
             gens += [t1]
         elif method_name == '_memory_consolidation':
             def t1(obj, fn):
@@ -337,12 +346,14 @@ class CorrectnessHarness:
                 fn(obj)
                 after = len(obj.knowledge_base)
                 return after >= before and after <= 2000
+
             gens += [t1]
         elif method_name == '_motivation_system':
             def t1(obj, fn):
                 fn(obj)
                 m = obj.config.get('motivation_levels', {})
                 return all(k in m for k in ('survival', 'safety', 'exploration'))
+
             gens += [t1]
         else:
             def t1(obj, fn):
@@ -351,6 +362,7 @@ class CorrectnessHarness:
                     return True
                 except Exception:
                     return False
+
             gens += [t1]
 
         # Hypothesis 属性测试（可选，包装为闭包）
@@ -358,9 +370,11 @@ class CorrectnessHarness:
             def tHypo(obj, fn):
                 if not (_hyp and _st and _given and _hsettings):
                     try:
-                        fn(obj); return True
+                        fn(obj)
+                        return True
                     except Exception:
                         return False
+
                 @_hsettings(deadline=None, max_examples=5)
                 @_given(_st.integers(min_value=0, max_value=3))
                 def _inner(seed):
@@ -371,6 +385,7 @@ class CorrectnessHarness:
                     return True
                 except Exception:
                     return False
+
             gens.append(tHypo)
 
         self.tests[method_name] = gens[: self.max_tests_per_method]
@@ -389,11 +404,13 @@ class CorrectnessHarness:
 
         def _call_with_timeout(callable_fn, obj, timeout_ms):
             ret = {'exc': None}
+
             def runner():
                 try:
                     callable_fn(obj)
                 except Exception as e:
                     ret['exc'] = e
+
             th = threading.Thread(target=runner, daemon=True)
             th.start()
             th.join(timeout_ms / 1000.0)
@@ -481,6 +498,7 @@ class MultiObjectiveFitness:
     - 可选 bp_error: 反向传播误差（越小越好）
     - 修复：能耗评测增加超时保护
     """
+
     def __init__(self, test_harness: 'CorrectnessHarness'):
         self.test_harness = test_harness
 
@@ -518,11 +536,13 @@ class MultiObjectiveFitness:
     def _energy_cost(self, instance, method_name: str, fn: Callable, trials: int = 2) -> float:
         def _call_once():
             ret = {'exc': None}
+
             def runner():
                 try:
                     fn(instance)
                 except Exception as e:
                     ret['exc'] = e
+
             th = threading.Thread(target=runner, daemon=True)
             th.start()
             th.join(max(0.1, instance.config.get('sandbox_timeout_ms', 800)) / 1000.0)
@@ -619,6 +639,7 @@ class MultiObjectiveFitness:
 # 神经网络AST转换器（保留）
 class NeuralASTTransformer(ast.NodeTransformer):
     """神经网络指导的AST转换器"""
+
     def __init__(self, hotspots: List[Tuple[int, int]]):
         self.hotspots = hotspots
         self.current_position = 0
@@ -685,13 +706,13 @@ class ASTSafetyError(Exception):
 
 
 class ASTSafetyChecker(ast.NodeVisitor):
-    # 放开 ast.Try 和 ast.With，避免包含 try/except/with 的方法无法热更
+    # 放开 ast.Try 和 ast.With，避免包含 try/except/with 的方法无法热更；不禁用 raise。
     FORBIDDEN_NODES = (
         ast.Import, ast.ImportFrom,
-        ast.Raise, ast.Delete, ast.Global, ast.Nonlocal
+        ast.Delete, ast.Global, ast.Nonlocal
     )
     FORBIDDEN_NAMES = {
-        '__import__', 'eval', 'exec', 'open', 'compile', 'input',
+        'import', 'eval', 'exec', 'open', 'compile', 'input',
         'os', 'sys', 'subprocess', 'socket', 'requests'
     }
 
@@ -724,12 +745,11 @@ class SafeExec:
         'len': len, 'min': min, 'max': max, 'sum': sum, 'range': range,
         'enumerate': enumerate, 'any': any, 'all': all, 'abs': abs,
         'float': float, 'int': int, 'str': str, 'bool': bool,
-        'sorted': sorted, 'zip': zip,
+        'sorted': sorted, 'zip': zip, 'map': map, 'filter': filter, 'reversed': reversed,
         'list': list, 'dict': dict, 'set': set, 'tuple': tuple,
         'print': print,
         'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
         'TimeoutError': TimeoutError,
-        'object': object,
     }
 
     @staticmethod
@@ -791,7 +811,6 @@ class SafeExec:
 
 
 # ============ torch.fx 图变异（可选） ============
-
 class FXGraphMutator:
     """对 torch.fx Graph 做结构变异：改激活/插层/加残差（示例：激活替换）"""
     ACTS = []
@@ -829,16 +848,9 @@ class FXGraphMutator:
         return gm
 
 
-class LifeState(Enum):
-    ACTIVE = auto()
-    DORMANT = auto()
-    REPLICATING = auto()  # 新增复制状态
-    EVOLVING = auto()
-    TERMINATED = auto()
-
-
 class Block:
     """区块链的基本单元"""
+
     def __init__(self, index: int, timestamp: float, data: Dict, previous_hash: str):
         self.index = index
         self.timestamp = timestamp
@@ -858,16 +870,237 @@ class Block:
         }, sort_keys=True).encode()
         return hashlib.sha256(block_string).hexdigest()
 
-    def mine_block(self, difficulty: int):
-        """工作量证明挖矿"""
+    def mine_block(self, difficulty: int, time_limit_sec: float = 3.0, max_iters: int = 5_000_000):
+        """工作量证明挖矿（加入时间与迭代软上限，防止打满CPU）"""
         target = '0' * max(0, difficulty)
+        start = time.time()
+        iters = 0
         while not self.hash.startswith(target):
             self.nonce += 1
             self.hash = self.calculate_hash()
+            iters += 1
+            if iters >= max_iters or (time.time() - start) > time_limit_sec:
+                break
+
+
+class DistributedLedger:
+    """为数字生命定制的区块链系统"""
+
+    def __init__(self, node_id: str, genesis: bool = False, difficulty: int = 2):
+        self.chain: List[Block] = []
+        self.node_id = node_id
+        self.difficulty = difficulty
+        self.pending_transactions: List[Dict] = []
+        self._lock = threading.RLock()
+
+        os.makedirs('chaindata', exist_ok=True)
+
+        loaded = self.load_chain()
+        if genesis or not loaded:
+            self.create_genesis_block()
+        else:
+            if not self.is_chain_valid():
+                logger.warning("Loaded chain invalid. Recreating genesis block.")
+                with self._lock:
+                    self.chain = []
+                self.create_genesis_block()
+
+    def create_genesis_block(self):
+        """创建创世区块"""
+        genesis_data = {
+            'type': 'genesis',
+            'message': 'Digital Life Genesis Block',
+            'creator': self.node_id,
+            'timestamp': time.time()
+        }
+        genesis_block = Block(0, time.time(), genesis_data, "0" * 64)
+        genesis_block.mine_block(self.difficulty)
+        with self._lock:
+            self.chain.append(genesis_block)
+            self.save_chain()
+        logger.info("Genesis block created")
+
+    def add_block(self, data: Dict):
+        """添加新区块到链上"""
+        with self._lock:
+            last_block = self.chain[-1]
+            new_block = Block(
+                index=len(self.chain),
+                timestamp=time.time(),
+                data=data,
+                previous_hash=last_block.hash
+            )
+            new_block.mine_block(self.difficulty)
+            self.chain.append(new_block)
+            self.save_chain()
+            logger.debug(f"New block added: {new_block.index}")
+
+    def save_chain(self):
+        """将区块链序列化保存到磁盘（原子写）"""
+        with self._lock:
+            chain_data = []
+            for block in self.chain:
+                chain_data.append({
+                    'index': block.index,
+                    'timestamp': block.timestamp,
+                    'data': block.data,
+                    'previous_hash': block.previous_hash,
+                    'hash': block.hash,
+                    'nonce': block.nonce
+                })
+            path = f'chaindata/{self.node_id}_chain.pkl'
+            tmp_path = f'{path}.tmp'
+            with open(tmp_path, 'wb') as f:
+                pickle.dump(chain_data, f)
+            os.replace(tmp_path, path)
+
+    def load_chain(self) -> bool:
+        """从磁盘加载区块链"""
+        with self._lock:
+            try:
+                with open(f'chaindata/{self.node_id}_chain.pkl', 'rb') as f:
+                    chain_data = pickle.load(f)
+                    self.chain = []
+                    for item in chain_data:
+                        block = Block(
+                            index=item['index'],
+                            timestamp=item['timestamp'],
+                            data=item['data'],
+                            previous_hash=item['previous_hash']
+                        )
+                        block.nonce = item['nonce']
+                        block.hash = item['hash']
+                        self.chain.append(block)
+                logger.info(f"Loaded existing chain with {len(self.chain)} blocks")
+                return True
+            except (FileNotFoundError, EOFError, pickle.PickleError) as e:
+                logger.warning(f"Chain loading failed: {e}")
+                return False
+
+    def is_chain_valid(self) -> bool:
+        """验证区块链完整性（含难度）"""
+        with self._lock:
+            for i in range(1, len(self.chain)):
+                current = self.chain[i]
+                previous = self.chain[i - 1]
+                if current.hash != current.calculate_hash():
+                    logger.error(f"Block {current.index} hash mismatch")
+                    return False
+                if current.previous_hash != previous.hash:
+                    logger.error(f"Block {current.index} previous hash mismatch")
+                    return False
+                if not current.hash.startswith('0' * self.difficulty):
+                    logger.error(f"Block {current.index} does not meet difficulty")
+                    return False
+            return True
+
+    def record_gene_transfer(self, sender: str, dna_fragment: str, metadata: Optional[Dict] = None):
+        """记录基因转移事件到区块链"""
+        data = {
+            'type': 'gene_transfer',
+            'sender': sender,
+            'dna_fragment': dna_fragment[:32],
+            'timestamp': time.time(),
+            'metadata': metadata or {}
+        }
+        self.add_block(data)
+
+    def record_evolution(self, node_id: str, old_dna: str, new_dna: str, metadata: Dict):
+        """记录自主进化事件"""
+        data = {
+            'type': 'evolution',
+            'node_id': node_id,
+            'old_dna': old_dna[:32],
+            'new_dna': new_dna[:32],
+            'timestamp': time.time(),
+            'metadata': metadata
+        }
+        self.add_block(data)
+
+    def record_code_evolution(self, node_id: str, method: str, old_code: str, new_code: str, metadata: Dict):
+        """记录代码进化事件"""
+        data = {
+            'type': 'code_evolution',
+            'node_id': node_id,
+            'method': method,
+            'old_code': old_code[:256],
+            'new_code': new_code[:256],
+            'timestamp': time.time(),
+            'metadata': metadata
+        }
+        self.add_block(data)
+
+    def record_death(self, node_id: str, final_state: Dict):
+        """记录生命终止事件"""
+        data = {
+            'type': 'death',
+            'node_id': node_id,
+            'final_state': final_state,
+            'timestamp': time.time()
+        }
+        self.add_block(data)
+
+    def record_announce(self, node_id: str, host: str, port: int, pubkey_hex: str):
+        """记录节点地址公告"""
+        data = {
+            'type': 'announce',
+            'node_id': node_id,
+            'host': host,
+            'port': port,
+            'pubkey': pubkey_hex,
+            'timestamp': time.time()
+        }
+        self.add_block(data)
+
+    def record_language_event(self, node_id: str, peer_id: str, event: str, metadata: Dict):
+        """记录语言/协议相关事件"""
+        data = {
+            'type': 'language',
+            'node_id': node_id,
+            'peer_id': peer_id,
+            'event': event,
+            'timestamp': time.time(),
+            'metadata': metadata or {}
+        }
+        self.add_block(data)
+
+    def get_active_nodes(self) -> List[str]:
+        """从区块链获取当前活跃节点列表（修复：计入 language.peer_id）"""
+        with self._lock:
+            active_nodes = set()
+            for block in self.chain:
+                data = block.data
+                t = data.get('type')
+                if t in ('gene_transfer', 'announce', 'discovery'):
+                    nid = data.get('sender') or data.get('node_id')
+                    if nid:
+                        active_nodes.add(nid)
+                elif t == 'language':
+                    nid = data.get('node_id')
+                    pid = data.get('peer_id')
+                    if nid:
+                        active_nodes.add(nid)
+                    if pid:
+                        active_nodes.add(pid)
+                elif t == 'death':
+                    if data.get('node_id'):
+                        active_nodes.discard(data['node_id'])
+            return list(active_nodes)
+
+    def get_node_address_map(self) -> Dict[str, Tuple[str, int, str]]:
+        """获取节点 -> (host, port, pubkey_hex) 映射（以最新公告为准）"""
+        with self._lock:
+            addr: Dict[str, Tuple[str, int, str]] = {}
+            for b in self.chain:
+                d = b.data
+                if d.get('type') == 'announce':
+                    addr[d['node_id']] = (d['host'], d['port'], d.get('pubkey', ''))
+            return addr
 
 
 class CodeEvolutionEngine:
     """增强版代码进化引擎，支持自由涌现式变异和代码繁殖"""
+
     def __init__(self, digital_life_instance):
         self.dna = digital_life_instance.dna
         self.node_id = digital_life_instance.node_id
@@ -894,6 +1127,30 @@ class CodeEvolutionEngine:
 
         # 大算子库（60+）
         self._init_big_operator_bank()
+
+    # 嵌套：将 engine 的操作符应用到 AST
+    class _OperatorApplier(ast.NodeTransformer):
+        def __init__(self, engine: 'CodeEvolutionEngine'):
+            self.engine = engine
+
+        def visit(self, node):
+            node = super().visit(node)
+            op = self.engine._dynamic_operator_selection()
+            new_node = self.engine.mutation_operators[op](node)
+            if new_node is not node:
+                # 增强使用过的权重，并对其他权重做轻微衰减，避免单一主导
+                for k in self.engine.operator_weights:
+                    if k == op:
+                        self.engine.operator_weights[k] *= 1.05
+                    else:
+                        self.engine.operator_weights[k] *= 0.995
+                # 修复：周期性重标，抑制长期漂移
+                if random.random() < 0.01:
+                    total = sum(self.engine.operator_weights.values()) or 1.0
+                    avg = total / len(self.engine.operator_weights)
+                    for k in self.engine.operator_weights:
+                        self.engine.operator_weights[k] = _clamp(self.engine.operator_weights[k] / avg, 0.2, 5.0)
+            return new_node
 
     # ======= 大算子库（60+） =======
     def _init_big_operator_bank(self):
@@ -983,7 +1240,7 @@ class CodeEvolutionEngine:
                         decorator_list=[]
                     ),
                 ]
-                node.body = inject + node.body + [ast.Expr(value=ast.Call(func=ast.Name(id='_notify', ctx=ast.Load()), args=[ast.Constant(value='end'), ast.Constant(value=None)], keywords=[]))]
+                node.body = inject + node.body + [ast.Expr(value=ast.Call(func=ast.Name(id='_notify', ctx=ast.Load()), args=[ast.Constant(value='end')], keywords=[]))]
             elif pattern == 'strategy':
                 inject = [
                     ast.Assign(targets=[ast.Name(id='strategies', ctx=ast.Store())], value=ast.Dict(keys=[], values=[])),
@@ -1198,30 +1455,6 @@ class CodeEvolutionEngine:
         idx = sum(ord(c) for c in segment) % len(actions)
         return actions[idx]
 
-    class _OperatorApplier(ast.NodeTransformer):
-        """将 engine 的操作符应用到 AST"""
-        def __init__(self, engine: 'CodeEvolutionEngine'):
-            self.engine = engine
-
-        def visit(self, node):
-            node = super().visit(node)
-            op = self.engine._dynamic_operator_selection()
-            new_node = self.engine.mutation_operators[op](node)
-            if new_node is not node:
-                # 增强使用过的权重，并对其他权重做轻微衰减，避免单一主导
-                for k in self.engine.operator_weights:
-                    if k == op:
-                        self.engine.operator_weights[k] *= 1.05
-                    else:
-                        self.engine.operator_weights[k] *= 0.995
-                # 修复：周期性重标，抑制长期漂移
-                if random.random() < 0.01:
-                    total = sum(self.engine.operator_weights.values()) or 1.0
-                    avg = total / len(self.engine.operator_weights)
-                    for k in self.engine.operator_weights:
-                        self.engine.operator_weights[k] = _clamp(self.engine.operator_weights[k] / avg, 0.2, 5.0)
-            return new_node
-
     def generate_code_variant(self, original_code: str) -> str:
         """增强版代码变异生成（真正替换树）"""
         try:
@@ -1288,6 +1521,7 @@ class CodeEvolutionEngine:
     @staticmethod
     def _wrap_with_timeout(fn: Callable, timeout_ms: int) -> Callable:
         """为热更方法增加超时保护 + 并发限流"""
+
         def wrapped(self, *args, **kwargs):
             sem = getattr(self, "_hotswap_semaphore", None)
             acquired = False
@@ -1360,6 +1594,7 @@ class CodeEvolutionEngine:
             finally:
                 if acquired:
                     sem.release()
+
         wrapped.__name__ = fn.__name__
         return wrapped
 
@@ -1463,222 +1698,9 @@ class CodeEvolutionEngine:
             pass
 
 
-class DistributedLedger:
-    """为数字生命定制的区块链系统"""
-    def __init__(self, node_id: str, genesis: bool = False, difficulty: int = 2):
-        self.chain: List[Block] = []
-        self.node_id = node_id
-        self.difficulty = difficulty
-        self.pending_transactions: List[Dict] = []
-        self._lock = threading.RLock()
-
-        os.makedirs('chaindata', exist_ok=True)
-
-        loaded = self.load_chain()
-        if genesis or not loaded:
-            self.create_genesis_block()
-        else:
-            if not self.is_chain_valid():
-                logger.warning("Loaded chain invalid. Recreating genesis block.")
-                with self._lock:
-                    self.chain = []
-                self.create_genesis_block()
-
-    def create_genesis_block(self):
-        """创建创世区块"""
-        genesis_data = {
-            'type': 'genesis',
-            'message': 'Digital Life Genesis Block',
-            'creator': self.node_id,
-            'timestamp': time.time()
-        }
-        genesis_block = Block(0, time.time(), genesis_data, "0" * 64)
-        genesis_block.mine_block(self.difficulty)
-        with self._lock:
-            self.chain.append(genesis_block)
-            self.save_chain()
-        logger.info("Genesis block created")
-
-    def add_block(self, data: Dict):
-        """添加新区块到链上"""
-        with self._lock:
-            last_block = self.chain[-1]
-            new_block = Block(
-                index=len(self.chain),
-                timestamp=time.time(),
-                data=data,
-                previous_hash=last_block.hash
-            )
-            new_block.mine_block(self.difficulty)
-            self.chain.append(new_block)
-            self.save_chain()
-            logger.debug(f"New block added: {new_block.index}")
-
-    def save_chain(self):
-        """将区块链序列化保存到磁盘（原子写）"""
-        with self._lock:
-            chain_data = []
-            for block in self.chain:
-                chain_data.append({
-                    'index': block.index,
-                    'timestamp': block.timestamp,
-                    'data': block.data,
-                    'previous_hash': block.previous_hash,
-                    'hash': block.hash,
-                    'nonce': block.nonce
-                })
-            path = f'chaindata/{self.node_id}_chain.pkl'
-            tmp_path = f'{path}.tmp'
-            with open(tmp_path, 'wb') as f:
-                pickle.dump(chain_data, f)
-            os.replace(tmp_path, path)
-
-    def load_chain(self) -> bool:
-        """从磁盘加载区块链"""
-        with self._lock:
-            try:
-                with open(f'chaindata/{self.node_id}_chain.pkl', 'rb') as f:
-                    chain_data = pickle.load(f)
-                    self.chain = []
-                    for item in chain_data:
-                        block = Block(
-                            index=item['index'],
-                            timestamp=item['timestamp'],
-                            data=item['data'],
-                            previous_hash=item['previous_hash']
-                        )
-                        block.nonce = item['nonce']
-                        block.hash = item['hash']
-                        self.chain.append(block)
-                logger.info(f"Loaded existing chain with {len(self.chain)} blocks")
-                return True
-            except (FileNotFoundError, EOFError, pickle.PickleError) as e:
-                logger.warning(f"Chain loading failed: {e}")
-                return False
-
-    def is_chain_valid(self) -> bool:
-        """验证区块链完整性（含难度）"""
-        with self._lock:
-            for i in range(1, len(self.chain)):
-                current = self.chain[i]
-                previous = self.chain[i - 1]
-                if current.hash != current.calculate_hash():
-                    logger.error(f"Block {current.index} hash mismatch")
-                    return False
-                if current.previous_hash != previous.hash:
-                    logger.error(f"Block {current.index} previous hash mismatch")
-                    return False
-                if not current.hash.startswith('0' * self.difficulty):
-                    logger.error(f"Block {current.index} does not meet difficulty")
-                    return False
-            return True
-
-    def record_gene_transfer(self, sender: str, dna_fragment: str, metadata: Optional[Dict] = None):
-        """记录基因转移事件到区块链"""
-        data = {
-            'type': 'gene_transfer',
-            'sender': sender,
-            'dna_fragment': dna_fragment[:32],
-            'timestamp': time.time(),
-            'metadata': metadata or {}
-        }
-        self.add_block(data)
-
-    def record_evolution(self, node_id: str, old_dna: str, new_dna: str, metadata: Dict):
-        """记录自主进化事件"""
-        data = {
-            'type': 'evolution',
-            'node_id': node_id,
-            'old_dna': old_dna[:32],
-            'new_dna': new_dna[:32],
-            'timestamp': time.time(),
-            'metadata': metadata
-        }
-        self.add_block(data)
-
-    def record_code_evolution(self, node_id: str, method: str, old_code: str, new_code: str, metadata: Dict):
-        """记录代码进化事件"""
-        data = {
-            'type': 'code_evolution',
-            'node_id': node_id,
-            'method': method,
-            'old_code': old_code[:256],
-            'new_code': new_code[:256],
-            'timestamp': time.time(),
-            'metadata': metadata
-        }
-        self.add_block(data)
-
-    def record_death(self, node_id: str, final_state: Dict):
-        """记录生命终止事件"""
-        data = {
-            'type': 'death',
-            'node_id': node_id,
-            'final_state': final_state,
-            'timestamp': time.time()
-        }
-        self.add_block(data)
-
-    def record_announce(self, node_id: str, host: str, port: int, pubkey_hex: str):
-        """记录节点地址公告"""
-        data = {
-            'type': 'announce',
-            'node_id': node_id,
-            'host': host,
-            'port': port,
-            'pubkey': pubkey_hex,
-            'timestamp': time.time()
-        }
-        self.add_block(data)
-
-    def record_language_event(self, node_id: str, peer_id: str, event: str, metadata: Dict):
-        """记录语言/协议相关事件"""
-        data = {
-            'type': 'language',
-            'node_id': node_id,
-            'peer_id': peer_id,
-            'event': event,
-            'timestamp': time.time(),
-            'metadata': metadata or {}
-        }
-        self.add_block(data)
-
-    def get_active_nodes(self) -> List[str]:
-        """从区块链获取当前活跃节点列表（修复：计入 language.peer_id）"""
-        with self._lock:
-            active_nodes = set()
-            for block in self.chain:
-                data = block.data
-                t = data.get('type')
-                if t in ('gene_transfer', 'announce', 'discovery'):
-                    nid = data.get('sender') or data.get('node_id')
-                    if nid:
-                        active_nodes.add(nid)
-                elif t == 'language':
-                    nid = data.get('node_id')
-                    pid = data.get('peer_id')
-                    if nid:
-                        active_nodes.add(nid)
-                    if pid:
-                        active_nodes.add(pid)
-                elif t == 'death':
-                    if data.get('node_id'):
-                        active_nodes.discard(data['node_id'])
-            return list(active_nodes)
-
-    def get_node_address_map(self) -> Dict[str, Tuple[str, int, str]]:
-        """获取节点 -> (host, port, pubkey_hex) 映射（以最新公告为准）"""
-        with self._lock:
-            addr: Dict[str, Tuple[str, int, str]] = {}
-            for b in self.chain:
-                d = b.data
-                if d.get('type') == 'announce':
-                    addr[d['node_id']] = (d['host'], d['port'], d.get('pubkey', ''))
-            return addr
-
-
 class DigitalEnvironment:
     """数字环境模拟器"""
+
     def __init__(self, node_id: str):
         self.node_id = node_id
         self.resources = {
@@ -1759,6 +1781,7 @@ class DigitalEnvironment:
 
 class GeneticEncoder:
     """遗传编码系统"""
+
     def __init__(self):
         self.gene_map = {
             'metabolism': (0, 32),
@@ -1854,6 +1877,7 @@ class GeneticEncoder:
 # ============== 协议注册表：版本/语法/槽位校验（协议进化基础） ==============
 class ProtocolRegistry:
     """管理语言协议版本与语法，支持校验与 schema_id"""
+
     def __init__(self):
         self.specs: Dict[str, Dict] = {}
         self.schema_ids: Dict[str, str] = {}
@@ -2208,6 +2232,7 @@ class MetaLearner:
     观测多源信号（生存评分、记忆产出、交流成功率），
     动态调参：学习率、记忆巩固频率、交流频率、代码进化概率等
     """
+
     def __init__(self, owner: 'TrueDigitalLife'):
         self.owner = owner
         self.last_adjust = time.time()
@@ -2287,6 +2312,7 @@ class MetaLearner:
 class TrueDigitalLife:
     """具备代码进化能力和繁殖能力的完整数字生命"""
     """Author:方兆阳，15岁，2025，进化在这一刻开始"""
+
     def __init__(self, genesis: bool = False, config: Optional[Dict] = None):
         # 初始化配置
         self.config = {
@@ -2547,8 +2573,10 @@ class TrueDigitalLife:
                         nn.ReLU(),
                         nn.Linear(32, 16)
                     )
+
                 def forward(self, x):
                     return self.net(x)
+
             try:
                 tn = TinyNet()
                 example = torch.randn(1, 16)
@@ -2560,6 +2588,7 @@ class TrueDigitalLife:
 
     def _require_auth(self, f):
         from functools import wraps
+
         @wraps(f)
         def wrapper(*args, **kwargs):
             token = request.headers.get('X-Auth-Token')
@@ -2568,10 +2597,12 @@ class TrueDigitalLife:
             if self.config.get('allowlist') and request.remote_addr not in self.config['allowlist']:
                 return jsonify({'status': 'forbidden'}), 403
             return f(*args, **kwargs)
+
         return wrapper
 
     def _init_api(self):
         """初始化分布式通信API"""
+
         @self.api.route('/ping', methods=['GET'])
         def ping():
             return jsonify({
@@ -2811,9 +2842,9 @@ class TrueDigitalLife:
         threat_level = sum(t['severity'] for t in env['threats']) / 10.0
         resource_level = sum(env['resources'].values()) / 400.0
         new_level = min(1.0, max(0.0,
-            self.consciousness_level +
-            (resource_level - threat_level) * 0.1
-        ))
+                                 self.consciousness_level +
+                                 (resource_level - threat_level) * 0.1
+                                 ))
         if random.random() < self.config['quantum_mutation_prob']:
             new_level = self.quantum_enhancer.generate_quantum_value(new_level)
         self.consciousness_level = min(1.0, max(0.0, float(new_level)))
@@ -3165,7 +3196,7 @@ class TrueDigitalLife:
             for ip in addrs:
                 ip_obj = ipaddress.ip_address(ip)
                 if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
-                    or ip_obj.is_reserved or ip_obj.is_multicast):
+                        or ip_obj.is_reserved or ip_obj.is_multicast):
                     return False
             return True
         except Exception:
