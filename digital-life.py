@@ -273,6 +273,20 @@ class SafeExec:
     }
 
     @staticmethod
+    def _cleanup_linecache():
+        """限制 linecache 中变异源码的数量，避免无限增长"""
+        try:
+            keys = [k for k in list(linecache.cache.keys())
+                    if isinstance(k, str) and k.startswith('<mutation:')]
+            max_keep = 512
+            if len(keys) > max_keep:
+                to_remove = keys[:len(keys) - max_keep]
+                for k in to_remove:
+                    linecache.cache.pop(k, None)
+        except Exception:
+            pass
+
+    @staticmethod
     def compile_and_load(src: str, func_name: str, filename: Optional[str] = None, extra_globals: Optional[Dict[str, Any]] = None):
         src = textwrap.dedent(src).lstrip()
         tree = ast.parse(src)
@@ -293,6 +307,7 @@ class SafeExec:
             "np": np,
             "KMeans": KMeans,
             "StandardScaler": StandardScaler,
+            "LifeState": LifeState,  # 注入枚举供热更方法使用
             "__quantum_var__": random.randint(0, 1),
             "quantum_flag": random.randint(0, 1),
             "break_flag": False,
@@ -300,11 +315,12 @@ class SafeExec:
         if extra_globals:
             g.update(extra_globals)
 
-        # 注入到 linecache，保证 inspect.getsource 可用
+        # 注入到 linecache，保证 inspect.getsource 可用，并做清理
         lines = src.splitlines(True)
         if lines and not lines[-1].endswith('\n'):
             lines[-1] += '\n'
         linecache.cache[fname] = (len(src), None, lines, fname)
+        SafeExec._cleanup_linecache()
 
         l = {}
         exec(code, g, l)
@@ -619,7 +635,9 @@ class CodeEvolutionEngine:
 
     @staticmethod
     def _wrap_with_timeout(fn: Callable, timeout_ms: int) -> Callable:
-        """为热更方法增加超时保护 + 并发限流（线程 join，超时则置 break_flag 并抛出）"""
+        """为热更方法增加超时保护 + 并发限流（线程 join，超时则置 break_flag 并抛出）
+           增强：连续超时/异常自动回滚到备份版本
+        """
         def wrapped(self, *args, **kwargs):
             # 并发限流（依赖实例上的信号量）
             sem = getattr(self, "_hotswap_semaphore", None)
@@ -653,6 +671,7 @@ class CodeEvolutionEngine:
 
             try:
                 if t.is_alive():
+                    # 置 break_flag，尝试让目标函数提前结束
                     try:
                         fn.__globals__['break_flag'] = True
                     except Exception:
@@ -660,10 +679,41 @@ class CodeEvolutionEngine:
                     # 记录一次超时
                     timeouts.append(time.time())
                     setattr(self, "_hotswap_timeouts", timeouts)
+
+                    # 针对该方法的连续超时计数，并触发回滚
+                    try:
+                        by_fn = getattr(self, "_hotswap_timeout_by_fn", {})
+                        dq = by_fn.get(fn.__name__, deque(maxlen=5))
+                        dq.append(time.time())
+                        by_fn[fn.__name__] = dq
+                        setattr(self, "_hotswap_timeout_by_fn", by_fn)
+                        recent = [x for x in dq if time.time() - x < 60]
+                        if len(recent) >= 3:
+                            engine = getattr(self, "code_engine", None)
+                            if engine and hasattr(engine, "rollback_method"):
+                                engine.rollback_method(self, fn.__name__)
+                    except Exception:
+                        pass
+
                     raise TimeoutError(f"Sandbox timeout: {fn.__name__}")
 
                 if exc_holder['exc'] is not None:
+                    # 连续异常计数，并在阈值内回滚
+                    try:
+                        failures = getattr(self, "_hotswap_failures", {})
+                        dq = failures.get(fn.__name__, deque(maxlen=5))
+                        dq.append(time.time())
+                        failures[fn.__name__] = dq
+                        setattr(self, "_hotswap_failures", failures)
+                        recent = [x for x in dq if time.time() - x < 60]
+                        if len(recent) >= 3:
+                            engine = getattr(self, "code_engine", None)
+                            if engine and hasattr(engine, "rollback_method"):
+                                engine.rollback_method(self, fn.__name__)
+                    except Exception:
+                        pass
                     raise exc_holder['exc']
+
                 return ret_holder['ret']
             finally:
                 if acquired:
@@ -717,8 +767,16 @@ class DistributedLedger:
 
         os.makedirs('chaindata', exist_ok=True)
 
-        if genesis or not self.load_chain():
+        loaded = self.load_chain()
+        if genesis or not loaded:
             self.create_genesis_block()
+        else:
+            # 加载成功后校验链有效性，若失败则重建创世块
+            if not self.is_chain_valid():
+                logger.warning("Loaded chain invalid. Recreating genesis block.")
+                with self._lock:
+                    self.chain = []
+                self.create_genesis_block()
 
     def create_genesis_block(self):
         """创建创世区块"""
@@ -1077,7 +1135,7 @@ class TrueDigitalLife:
             'max_replication_per_hour': 2,
             'sandbox_timeout_ms': 800,
             'max_payload_bytes': 1 * 1024 * 1024,
-            'strict_target_ip_check': False  # 启用后，仅将复制包发送到公共IP，缓解 SSRF
+            'strict_target_ip_check': True  # 默认开启：仅发送到公共IP，缓解 SSRF
         }
         if config:
             self.config.update(config)
@@ -1087,6 +1145,10 @@ class TrueDigitalLife:
         self._replication_times: Deque[float] = deque(maxlen=100)
         self._hotswap_semaphore = threading.Semaphore(4)
         self._hotswap_timeouts: Deque[float] = deque(maxlen=50)
+
+        # 知识与记忆并发锁
+        self._kb_lock = threading.RLock()
+        self._mem_lock = threading.RLock()
 
         # 生命状态管理
         self.state = LifeState.ACTIVE
@@ -1344,9 +1406,19 @@ class TrueDigitalLife:
                 return jsonify({'status': 'forbidden'}), 403
             if self.state == LifeState.REPLICATING:
                 return jsonify({'status': 'busy_replicating'}), 400
+
             code_data = request.json
             if not code_data or 'payload' not in code_data or 'sig' not in code_data or 'pubkey' not in code_data:
                 return jsonify({'status': 'invalid_code'}), 400
+
+            # 基础格式快速校验，避免无谓的重计算
+            sig_hex = code_data.get('sig', '')
+            pubkey_hex = code_data.get('pubkey', '')
+            if not (isinstance(sig_hex, str) and len(sig_hex) == 128 and all(c in '0123456789abcdefABCDEF' for c in sig_hex)):
+                return jsonify({'status': 'bad_signature_format'}), 400
+            if not (isinstance(pubkey_hex, str) and len(pubkey_hex) == 64 and all(c in '0123456789abcdefABCDEF' for c in pubkey_hex)):
+                return jsonify({'status': 'bad_pubkey_format'}), 400
+
             threading.Thread(target=self._integrate_code, args=(code_data,), daemon=True).start()
             return jsonify({'status': 'code_received'})
 
@@ -1354,7 +1426,8 @@ class TrueDigitalLife:
         """运行分布式API服务器"""
         try:
             logger.info(f"API server starting on {self.config['host']}:{self.config['port']} (token head: {self.config['auth_token'][:6]}**)")
-            self.api.run(host=self.config['host'], port=self.config['port'], debug=False)
+            # 使用 threaded 模式，关闭 reloader，防止重复启动
+            self.api.run(host=self.config['host'], port=self.config['port'], debug=False, threaded=True, use_reloader=False)
         except Exception as e:
             logger.error(f"API server failed: {e}")
 
@@ -1411,21 +1484,23 @@ class TrueDigitalLife:
     def _environment_scan(self):
         """环境扫描与响应"""
         env = self.environment.scan()
-        self.short_term_memory.append({
-            'timestamp': time.time(),
-            'environment': env,
-            'state': self.state.name,
-            'energy': self.energy,
-            'pleasure': self.pleasure,
-            'stress': self.stress
-        })
+        with self._mem_lock:
+            self.short_term_memory.append({
+                'timestamp': time.time(),
+                'environment': env,
+                'state': self.state.name,
+                'energy': self.energy,
+                'pleasure': self.pleasure,
+                'stress': self.stress
+            })
         for threat in env['threats']:
             if threat['severity'] > 5 and self.state == LifeState.ACTIVE:
                 self.state = LifeState.DORMANT
                 logger.warning(f"Entered dormant state due to threat: {threat['type']}")
                 break
         if random.random() < 0.1:
-            self.long_term_memory.append(copy.deepcopy(self.short_term_memory[-1]))
+            with self._mem_lock:
+                self.long_term_memory.append(copy.deepcopy(self.short_term_memory[-1]))
 
     def _survival_goal_evaluation(self, update_state: bool = True):
         """生存目标评估系统"""
@@ -1446,10 +1521,11 @@ class TrueDigitalLife:
 
     def _memory_consolidation(self):
         """记忆巩固与知识提取"""
-        if len(self.short_term_memory) < 10:
-            return
-        try:
+        with self._mem_lock:
+            if len(self.short_term_memory) < 10:
+                return
             recent_memories = list(self.short_term_memory)[-10:]
+        try:
             features = []
             for mem in recent_memories:
                 features.append([
@@ -1476,8 +1552,10 @@ class TrueDigitalLife:
                     'count': len(cluster_features),
                     'first_seen': time.time()
                 }
-                self.knowledge_base[f'pattern_{cluster_id}_{int(time.time())}'] = knowledge
-            self._prune_knowledge_base(max_items=2000)
+                with self._kb_lock:
+                    self.knowledge_base[f'pattern_{cluster_id}_{int(time.time())}'] = knowledge
+            with self._kb_lock:
+                self._prune_knowledge_base(max_items=2000)
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
 
@@ -1768,6 +1846,9 @@ class TrueDigitalLife:
                     if fitness > self.config['replication_threshold']:
                         if self.code_engine.hotswap_method(self, method_name, code):
                             logger.info(f"Integrated {method_name} from donor (fitness: {fitness:.2f})")
+                            # 更新本地源码与版本号
+                            self.code_version += 1
+                            self._method_sources[method_name] = code
                             try:
                                 self.blockchain.record_code_evolution(
                                     self.node_id,
@@ -1786,10 +1867,11 @@ class TrueDigitalLife:
             # 整合知识（已有键不覆盖）
             incoming_knowledge = decrypted.get('knowledge', {})
             if isinstance(incoming_knowledge, dict):
-                for k, v in incoming_knowledge.items():
-                    if k not in self.knowledge_base:
-                        self.knowledge_base[k] = v
-                self._prune_knowledge_base(max_items=2000)
+                with self._kb_lock:
+                    for k, v in incoming_knowledge.items():
+                        if k not in self.knowledge_base:
+                            self.knowledge_base[k] = v
+                    self._prune_knowledge_base(max_items=2000)
 
             return True
 
@@ -1893,27 +1975,29 @@ class TrueDigitalLife:
 
     def _integrate_knowledge(self, knowledge: Dict):
         if isinstance(knowledge, dict):
-            self.knowledge_base.update(knowledge)
-            self._prune_knowledge_base(max_items=2000)
+            with self._kb_lock:
+                self.knowledge_base.update(knowledge)
+                self._prune_knowledge_base(max_items=2000)
             logger.info("Knowledge integrated")
 
     def _prune_knowledge_base(self, max_items: int = 2000):
         """限制知识库大小，基于 first_seen 或插入时间粗略裁剪"""
-        if len(self.knowledge_base) <= max_items:
-            return
-        items = []
-        for k, v in self.knowledge_base.items():
-            ts = 0.0
-            if isinstance(v, dict) and 'first_seen' in v:
-                try:
-                    ts = float(v['first_seen'])
-                except Exception:
-                    ts = 0.0
-            items.append((k, ts))
-        items.sort(key=lambda x: x[1])  # old first
-        to_remove = [k for k, _ in items[:max(0, len(items) - max_items)]]
-        for k in to_remove:
-            self.knowledge_base.pop(k, None)
+        with self._kb_lock:
+            if len(self.knowledge_base) <= max_items:
+                return
+            items = []
+            for k, v in self.knowledge_base.items():
+                ts = 0.0
+                if isinstance(v, dict) and 'first_seen' in v:
+                    try:
+                        ts = float(v['first_seen'])
+                    except Exception:
+                        ts = 0.0
+                items.append((k, ts))
+            items.sort(key=lambda x: x[1])  # old first
+            to_remove = [k for k, _ in items[:max(0, len(items) - max_items)]]
+            for k in to_remove:
+                self.knowledge_base.pop(k, None)
 
     def _validate_dna(self, dna: str) -> bool:
         """基础DNA校验：长度>=32且为hex，长度为32的倍数更佳"""
