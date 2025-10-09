@@ -21,6 +21,7 @@ import linecache
 import base64
 import secrets
 import ipaddress
+import tempfile
 from collections import deque
 from enum import Enum, auto
 from pathlib import Path
@@ -297,6 +298,7 @@ class CorrectnessHarness:
     - 每个可变方法维护一组测试（最多 N=16）
     - 通过率直接乘进 fitness（correctness）
     - 测试淘汰：对族群无区分度的测试被丢弃
+    - 修复：评测调用增加超时保护，防止死循环/递归卡死
     """
     def __init__(self, owner: 'TrueDigitalLife'):
         self.owner = owner
@@ -375,10 +377,38 @@ class CorrectnessHarness:
         self.test_value[method_name] = [1.0 for _ in self.tests[method_name]]
 
     def evaluate_method(self, instance, method_name: str, fn: Callable) -> float:
+        """
+        为每条测试用例用线程+超时包装执行 fn，避免死循环卡死测试。
+        """
         self._ensure_tests(method_name)
         tests = self.tests[method_name]
         if not tests:
             return 0.5
+
+        timeout_ms = int(instance.config.get('sandbox_timeout_ms', 800))
+
+        def _call_with_timeout(callable_fn, obj, timeout_ms):
+            ret = {'exc': None}
+            def runner():
+                try:
+                    callable_fn(obj)
+                except Exception as e:
+                    ret['exc'] = e
+            th = threading.Thread(target=runner, daemon=True)
+            th.start()
+            th.join(timeout_ms / 1000.0)
+            if th.is_alive():
+                try:
+                    callable_fn.__globals__['break_flag'] = True
+                except Exception:
+                    pass
+                raise TimeoutError("test timeout")
+            if ret['exc'] is not None:
+                raise ret['exc']
+
+        def safe_fn(obj):
+            _call_with_timeout(fn, obj, timeout_ms)
+
         passed = 0
         for i, t in enumerate(list(tests)):
             ok = False
@@ -395,7 +425,7 @@ class CorrectnessHarness:
                 'kb_keys': set(list(instance.knowledge_base.keys())[:50]),
             }
             try:
-                ok = bool(t(instance, fn))
+                ok = bool(t(instance, safe_fn))
             except Exception:
                 ok = False
             finally:
@@ -449,6 +479,7 @@ class MultiObjectiveFitness:
     - complexity: 圈复杂度 / AST 节点数代理（越小越好）
     - replicability: 是否包含 replicate() 调用（0.2/0.8）
     - 可选 bp_error: 反向传播误差（越小越好）
+    - 修复：能耗评测增加超时保护
     """
     def __init__(self, test_harness: 'CorrectnessHarness'):
         self.test_harness = test_harness
@@ -485,6 +516,24 @@ class MultiObjectiveFitness:
             return 0.2
 
     def _energy_cost(self, instance, method_name: str, fn: Callable, trials: int = 2) -> float:
+        def _call_once():
+            ret = {'exc': None}
+            def runner():
+                try:
+                    fn(instance)
+                except Exception as e:
+                    ret['exc'] = e
+            th = threading.Thread(target=runner, daemon=True)
+            th.start()
+            th.join(max(0.1, instance.config.get('sandbox_timeout_ms', 800)) / 1000.0)
+            if th.is_alive():
+                try:
+                    fn.__globals__['break_flag'] = True
+                except Exception:
+                    pass
+            if ret['exc'] is not None:
+                raise ret['exc']
+
         start_mem = 0
         try:
             start_mem = sum(sys.getsizeof(x) for x in (instance.energy, instance.knowledge_base, instance.short_term_memory))
@@ -492,14 +541,13 @@ class MultiObjectiveFitness:
             pass
 
         t0 = time.perf_counter()
-        ok = 0
         for _ in range(trials):
             try:
-                fn(instance)
-                ok += 1
+                _call_once()
             except Exception:
                 pass
         dt = max(1e-6, time.perf_counter() - t0)
+
         end_mem = 0
         try:
             end_mem = sum(sys.getsizeof(x) for x in (instance.energy, instance.knowledge_base, instance.short_term_memory))
@@ -752,19 +800,27 @@ class FXGraphMutator:
 
     @staticmethod
     def mutate(graph_module):
+        """
+        修复：真正替换父路径上的子模块（net.1 / net.act 等），避免 set 失败。
+        """
         if torch is None or fx is None:
             return graph_module
         gm = graph_module
         try:
             for n in gm.graph.nodes:
                 if n.op == 'call_module':
-                    target = dict(gm.named_modules()).get(n.target)
-                    if isinstance(target, tuple(FXGraphMutator.ACTS)) and random.random() < 0.4:
+                    mod_map = dict(gm.named_modules())
+                    target_mod = mod_map.get(n.target)
+                    if isinstance(target_mod, tuple(FXGraphMutator.ACTS)) and random.random() < 0.4:
                         new_act = random.choice(FXGraphMutator.ACTS)()
-                        # 替换模块
                         try:
-                            parent_name = n.target.rsplit('.', 1)[0] if '.' in n.target else ''
-                            setattr(gm, n.target, new_act)
+                            mod_path = n.target  # e.g., 'net.1' or 'net.act'
+                            if '.' in mod_path:
+                                parent_path, child_name = mod_path.rsplit('.', 1)
+                                parent_mod = gm.get_submodule(parent_path)
+                                setattr(parent_mod, child_name, new_act)
+                            else:
+                                setattr(gm, mod_path, new_act)
                         except Exception:
                             pass
             gm.recompile()
@@ -1158,6 +1214,12 @@ class CodeEvolutionEngine:
                         self.engine.operator_weights[k] *= 1.05
                     else:
                         self.engine.operator_weights[k] *= 0.995
+                # 修复：周期性重标，抑制长期漂移
+                if random.random() < 0.01:
+                    total = sum(self.engine.operator_weights.values()) or 1.0
+                    avg = total / len(self.engine.operator_weights)
+                    for k in self.engine.operator_weights:
+                        self.engine.operator_weights[k] = _clamp(self.engine.operator_weights[k] / avg, 0.2, 5.0)
             return new_node
 
     def generate_code_variant(self, original_code: str) -> str:
@@ -1359,7 +1421,7 @@ class CodeEvolutionEngine:
                 return None
             m = fx_info['module'].eval()
             x = torch.randn(1, 16)
-            tmp = f"/tmp/t_{uuid.uuid4().hex[:6]}.onnx"
+            tmp = os.path.join(tempfile.gettempdir(), f"t_{uuid.uuid4().hex[:6]}.onnx")
             torch.onnx.export(m, x, tmp, input_names=['x'], output_names=['y'], opset_version=12)
             sess = ort.InferenceSession(tmp, providers=['CPUExecutionProvider'])
             y = sess.run(['y'], {'x': x.numpy()})[0]
@@ -2207,6 +2269,18 @@ class MetaLearner:
         except Exception:
             pass
 
+        # 可选：对 torch.fx 图小概率变异
+        try:
+            if self.owner.config.get('neurosymbolic_enable', True) and random.random() < 0.05:
+                fx_info = self.owner.neural_net.get('torch_fx', None)
+                if fx_info and 'graph' in fx_info:
+                    gm = fx_info['graph']
+                    gm2 = FXGraphMutator.mutate(gm)
+                    if gm2:
+                        self.owner.neural_net['torch_fx']['graph'] = gm2
+        except Exception:
+            pass
+
         self.last_adjust = now
 
 
@@ -2900,8 +2974,9 @@ class TrueDigitalLife:
         for i, code in enumerate(variants):
             o = moea.evaluate(self, method_name, old_code, code)
             en_proxy, cx_proxy = static_pairs[i]
-            o['energy_cost'] = min(o['energy_cost'], en_proxy + 1e-6)
-            o['complexity'] = min(o['complexity'], cx_proxy + 1e-6)
+            # 修复：用加权平均融合静态近似，避免虚高
+            o['energy_cost'] = 0.5 * o['energy_cost'] + 0.5 * en_proxy
+            o['complexity'] = 0.5 * o['complexity'] + 0.5 * cx_proxy
             objs.append(o)
 
         harness.evolve_tests(method_name, objs)
