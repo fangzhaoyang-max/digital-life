@@ -409,6 +409,7 @@ class CorrectnessHarness:
 
             gens += [t1]
         else:
+            # 新增：为新涌现方法提供最小保底测试，避免早期被误杀
             def t1(obj, fn):
                 try:
                     fn(obj)
@@ -573,16 +574,37 @@ class MultiObjectiveFitness:
             return 999.0
 
     def _replicability(self, code: str) -> float:
+        """
+        扩展：将“新函数生成/调用”也作为正向信号（鼓励 emergent code 被实际调用）
+        - 包含 replicate()/replicate* 调用
+        - 包含 self.m_*/self.em_* 调用（默认新方法前缀；仅作为启发式）
+        - 包含局部函数定义（FunctionDef 内嵌 FunctionDef）
+        """
         try:
             tree = ast.parse(textwrap.dedent(code).lstrip())
-            has_rep = any(
-                isinstance(node, ast.Call) and (
-                    (isinstance(node.func, ast.Name) and 'replicate' in node.func.id) or
-                    (isinstance(node.func, ast.Attribute) and 'replicate' in node.func.attr)
-                )
-                for node in ast.walk(tree)
-            )
-            return 0.8 if has_rep else 0.2
+            has_rep = False
+            has_emergent_call = False
+            has_local_def = False
+            local_func_names: Set[str] = set()
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    f = node.func
+                    if isinstance(f, ast.Name) and 'replicate' in f.id:
+                        has_rep = True
+                    if isinstance(f, ast.Attribute):
+                        # self.m_* / self.em_*
+                        if isinstance(f.value, ast.Name) and f.value.id == 'self':
+                            if isinstance(f.attr, str) and (f.attr.startswith('m_') or f.attr.startswith('em_') or f.attr.startswith('f_')):
+                                has_emergent_call = True
+                if isinstance(node, ast.FunctionDef):
+                    # 检测内嵌函数（出现两个层级的 def）
+                    for ch in node.body:
+                        if isinstance(ch, ast.FunctionDef):
+                            has_local_def = True
+                            local_func_names.add(ch.name)
+
+            return 0.8 if (has_rep or has_emergent_call or has_local_def) else 0.2
         except Exception:
             return 0.2
 
@@ -803,6 +825,8 @@ class SafeExec:
         'print': print,
         'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
         'TimeoutError': TimeoutError,
+        # 新增：放开用于对象安全操作的内建（满足 emergent 方法的需要）
+        'getattr': getattr, 'setattr': setattr, 'hasattr': hasattr, 'callable': callable,
     }
 
     @staticmethod
@@ -1122,6 +1146,18 @@ class DistributedLedger:
         }
         self.add_block(data)
 
+    # 新增：记录“新函数涌现/注入”事件，便于追踪
+    def record_method_emergence(self, node_id: str, method: str, code: str, metadata: Optional[Dict] = None):
+        data = {
+            'type': 'method_emergence',
+            'node_id': node_id,
+            'method': method,
+            'code': (code or '')[:512],
+            'timestamp': time.time(),
+            'metadata': metadata or {}
+        }
+        self.add_block(data)
+
     def _scan_directory(self, ttl: float = 5.0) -> Tuple[Set[str], Dict[str, Tuple[str, int, str]]]:
         """
         扫描本机 chaindata 目录，聚合所有节点的活跃ID与地址公告。
@@ -1240,6 +1276,10 @@ class CodeEvolutionEngine:
         self.fitness_evaluator = DynamicFitnessEvaluator()
         self.owner = digital_life_instance  # 绑定宿主
 
+        # 记录已涌现的实例方法名（无上限）
+        self.emergent_methods: Set[str] = set()
+        self._last_synthesized_name: Optional[str] = None
+
         # 变异操作符（初始，会被大算子库覆盖）
         self.mutation_operators = {
             'control_flow': self._mutate_control_flow,
@@ -1314,6 +1354,11 @@ class CodeEvolutionEngine:
         # 7) 微扰族群（15个）
         for k in range(15):
             ops[f'micro_{k}'] = self._micro_mutation
+
+        # 8) 新增：函数合成与调用注入（实例方法 + 局部函数）
+        ops['synth_local'] = self._synthesize_local_function
+        ops['synth_inst'] = self._synthesize_instance_method_and_inject_call
+        ops['inject_call_any'] = self._inject_call_to_existing_emergent
 
         self.mutation_operators = ops
         self.operator_weights = {op: 1.0 for op in self.mutation_operators}
@@ -1585,6 +1630,14 @@ class CodeEvolutionEngine:
     def generate_code_variant(self, original_code: str) -> str:
         """增强版代码变异生成（真正替换树）"""
         try:
+            # 在生成变体前，小概率先合成一个新实例方法（确保后续注入调用点时可用）
+            if self.owner and self.owner.config.get('allow_emergent_functions', True):
+                if random.random() < 0.15:
+                    try:
+                        self._last_synthesized_name = self.synthesize_and_attach_method()
+                    except Exception:
+                        self._last_synthesized_name = None
+
             src = textwrap.dedent(original_code).lstrip()
             tree = ast.parse(src)
             tree = self._OperatorApplier(self).visit(tree)
@@ -1736,8 +1789,12 @@ class CodeEvolutionEngine:
                 filename=fname,
                 extra_globals={"__quantum_var__": random.randint(0, 1), "break_flag": False}
             )
-            if method_name not in self.backup_methods:
-                self.backup_methods[method_name] = getattr(instance, method_name)
+            # 兼容新方法首次创建：只有在已有旧方法时才记录备份
+            if method_name not in self.backup_methods and hasattr(instance, method_name):
+                try:
+                    self.backup_methods[method_name] = getattr(instance, method_name)
+                except Exception:
+                    pass
 
             timeout_ms = int(instance.config.get('sandbox_timeout_ms', 800))
             wrapped = self._wrap_with_timeout(new_method, timeout_ms)
@@ -1746,6 +1803,19 @@ class CodeEvolutionEngine:
             self.code_versions[method_name] = self.code_versions.get(method_name, 0) + 1
             if hasattr(instance, "_method_sources"):
                 instance._method_sources[method_name] = new_code
+
+            # 若是新方法，加入可变列表并记录链上事件
+            if hasattr(instance, "mutable_methods") and method_name not in instance.mutable_methods:
+                instance.mutable_methods.append(method_name)
+            self.emergent_methods.add(method_name)
+            try:
+                if hasattr(self.owner, "blockchain"):
+                    self.owner.blockchain.record_method_emergence(
+                        self.node_id, method_name, new_code,
+                        {'code_version': getattr(self.owner, 'code_version', 0)}
+                    )
+            except Exception:
+                pass
             return True
         except Exception as e:
             logger.error(f"Method hotswap failed: {e}")
@@ -1758,6 +1828,150 @@ class CodeEvolutionEngine:
             logger.info(f"Rolled back {method_name}")
             return True
         return False
+
+    # ===== Emergent functions: synthesize instance method & local function =====
+    def _emergent_name(self, prefix: Optional[str] = None) -> str:
+        base = (prefix or random.choice(['m', 'em', 'f'])) + '_' + uuid.uuid4().hex[:8]
+        # 避免与现有方法冲突
+        if hasattr(self.owner, 'mutable_methods'):
+            while base in self.owner.mutable_methods or hasattr(self.owner, base):
+                base = (prefix or random.choice(['m', 'em', 'f'])) + '_' + uuid.uuid4().hex[:8]
+        return base
+
+    def synthesize_and_attach_method(self, name_hint: Optional[str] = None) -> Optional[str]:
+        """
+        生成一个新的实例方法（带 self）并绑定到宿主，同时写入链上。
+        返回方法名；失败返回 None。
+        """
+        if not self.owner or not self.owner.config.get('allow_emergent_functions', True):
+            return None
+        try:
+            name = name_hint or self._emergent_name()
+            # 生成安全主体：仅用到 SafeExec 注入的对象
+            body = f'''
+def {name}(self, *args, **kwargs):
+    """
+    emergent method synthesized by CodeEvolutionEngine.
+    It is sandboxed and uses only allowed builtins and injected globals.
+    """
+    try:
+        # 轻量可观测副作用（安全上限内）
+        if hasattr(self, 'energy'):
+            self.energy = float(max(0.0, min(100.0, self.energy)))
+        info = {{
+            'ok': True,
+            'ts': time.time(),
+            'name': '{name}',
+            'state': getattr(self, 'state', None).name if hasattr(self, 'state') else None
+        }}
+        return info
+    except Exception as e:
+        return {{'ok': False, 'err': str(e)}}
+'''
+            ok = self.hotswap_method(self.owner, name, textwrap.dedent(body).lstrip())
+            if ok:
+                # 维护源代码缓存与版本号
+                if hasattr(self.owner, "_method_sources"):
+                    self.owner._method_sources[name] = textwrap.dedent(body).lstrip()
+                self.emergent_methods.add(name)
+                # 提升全局 code_version（可选）
+                try:
+                    if hasattr(self.owner, 'code_version'):
+                        self.owner.code_version += 1
+                except Exception:
+                    pass
+                # 测试用例最小化保障
+                try:
+                    th = getattr(self.owner, '_test_harness', None)
+                    if th:
+                        th._ensure_tests(name)
+                except Exception:
+                    pass
+                return name
+        except Exception as e:
+            logger.debug(f"synthesize_and_attach_method failed: {e}")
+        return None
+
+    def _synthesize_instance_method_and_inject_call(self, node: ast.AST) -> ast.AST:
+        """
+        若访问到 FunctionDef，合成一个新实例方法并在当前函数体中注入 self.<new>() 调用。
+        """
+        if not isinstance(node, ast.FunctionDef):
+            return node
+        if not self.owner or not self.owner.config.get('allow_emergent_functions', True):
+            return node
+        try:
+            # 合成并绑定新方法
+            new_name = self._last_synthesized_name or self.synthesize_and_attach_method()
+            if not new_name:
+                return node
+            # 在当前函数体末尾追加一次调用（作为副作用/覆盖触发）
+            call_stmt = ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=new_name, ctx=ast.Load()),
+                    args=[],
+                    keywords=[]
+                )
+            )
+            node.body.append(call_stmt)
+        except Exception:
+            pass
+        return node
+
+    def _synthesize_local_function(self, node: ast.AST) -> ast.AST:
+        """
+        在函数内部合成一个局部函数并注入一次调用。
+        不使用 nonlocal/global，确保沙箱安全。
+        """
+        if not isinstance(node, ast.FunctionDef):
+            return node
+        try:
+            suffix = uuid.uuid4().hex[:6]
+            local_name = f"local_{suffix}"
+            # def local_x(): return {'ts': time.time(), 'k': __quantum_var__}
+            local_def = ast.FunctionDef(
+                name=local_name,
+                args=ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+                body=[
+                    ast.Return(
+                        value=ast.Dict(
+                            keys=[ast.Constant(value='ts'), ast.Constant(value='k')],
+                            values=[
+                                ast.Call(func=ast.Attribute(value=ast.Name(id='time', ctx=ast.Load()), attr='time', ctx=ast.Load()), args=[], keywords=[]),
+                                ast.Name(id='__quantum_var__', ctx=ast.Load())
+                            ]
+                        )
+                    )
+                ],
+                decorator_list=[]
+            )
+            # 插入定义与调用
+            node.body.insert(0, local_def)
+            node.body.insert(1, ast.Expr(value=ast.Call(func=ast.Name(id=local_name, ctx=ast.Load()), args=[], keywords=[])))
+        except Exception:
+            pass
+        return node
+
+    def _inject_call_to_existing_emergent(self, node: ast.AST) -> ast.AST:
+        """
+        在已有新方法存在时，向现有函数体注入一次 self.<emergent>() 调用。
+        """
+        if not isinstance(node, ast.FunctionDef):
+            return node
+        try:
+            if not self.emergent_methods:
+                return node
+            target = random.choice(list(self.emergent_methods))
+            call_stmt = ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=target, ctx=ast.Load()),
+                    args=[], keywords=[]
+                )
+            )
+            node.body.append(call_stmt)
+        except Exception:
+            pass
+        return node
 
     # ====== 可选硬件加速/近似 ======
     def _batch_static_metrics(self, codes: List[str]) -> List[Tuple[float, float]]:
@@ -1812,6 +2026,9 @@ class CodeEvolutionEngine:
                 self.operator_weights[k] *= (0.95 if avg_energy > 0.1 else 1.02)
             if k.startswith('df_add') or k.startswith('micro_'):
                 self.operator_weights[k] *= (1.03 if avg_energy > 0.1 else 0.99)
+            # 新函数生成相关算子：在 correctness 低、但 energy 低时适当鼓励探索
+            if k in ('synth_local', 'synth_inst', 'inject_call_any'):
+                self.operator_weights[k] *= (1.06 if (avg_corr < 0.55 and avg_energy < 0.2) else 0.995)
             self.operator_weights[k] = float(_clamp(self.operator_weights[k], 0.2, 5.0))
 
         # 读取 DNA 策略基因并作用
@@ -1824,7 +2041,6 @@ class CodeEvolutionEngine:
             self.owner.config['sandbox_timeout_ms'] = int(_clamp(to, 200, 3000))
         except Exception:
             pass
-
 
 class DigitalEnvironment:
     """数字环境模拟器（支持真实主机感知：CPU/内存/网络吞吐，降级为随机模拟）"""
@@ -2530,6 +2746,9 @@ class TrueDigitalLife:
             'meta_strategy_enable': True,
             'accelerate_enable': True,
             'population_size': 8,
+
+            # 新增：允许自由涌现的新函数（实例方法与局部函数）
+            'allow_emergent_functions': True,
         }
         if config:
             self.config.update(config)
@@ -3165,6 +3384,13 @@ class TrueDigitalLife:
 
     def _evolution_cycle(self):
         """进化循环 - 多目标 + correctness 驱动 + Pareto + 策略进化"""
+        # 小概率直接合成一个新实例方法（解除生成新函数的限制，独立于能量门槛）
+        if self.config.get('allow_emergent_functions', True) and random.random() < 0.08:
+            try:
+                self.code_engine.synthesize_and_attach_method()
+            except Exception:
+                pass
+
         if (self.energy < self.config['min_energy_for_code_evo'] or
                 random.random() > self.config['code_evolution_prob']):
             return
