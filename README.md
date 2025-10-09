@@ -223,7 +223,7 @@ cd digital-life
 pip install -r requirements.txt
 
 # 在隔离环境中运行（推荐）
-python digital-life1.9.py
+python digital-life.py
 ```
 
 ### 安全运行建议
@@ -238,8 +238,7 @@ python digital-life1.9.py
 
 ```
 digital-life/
-├── digital-life1.9.py          # 最新版本主程序(建议运行)
-├── digital-life1.0-1.8.py      # 历史版本
+├── digital-life.py                  # 最新版本主程序(建议运行)
 ├── Digital-Prokaryote-1.0.py        # 原核细胞版本(数字生命的升级版，未完成)
 ├── God.py                           # 创世程序
 ├── Adam.py                          # 第一个原始数字生命
