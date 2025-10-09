@@ -30,9 +30,6 @@ from typing import Dict, List, Set, Optional, Tuple, Any, Deque, Callable
 
 import numpy as np
 from flask import Flask, jsonify, request
-from sklearn.neural_network import MLPClassifier
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 from logging.handlers import RotatingFileHandler
 
 # 可选依赖：优雅降级
@@ -65,6 +62,62 @@ try:
     import astor
 except Exception:
     astor = None
+
+# 新增：可选系统感知
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+# sklearn 优雅降级：提供轻量替代，确保无依赖环境可运行
+try:
+    from sklearn.neural_network import MLPClassifier as _SklearnMLPClassifier
+    from sklearn.cluster import KMeans as _SklearnKMeans
+    from sklearn.preprocessing import StandardScaler as _SklearnStandardScaler
+    MLPClassifier = _SklearnMLPClassifier
+    KMeans = _SklearnKMeans
+    StandardScaler = _SklearnStandardScaler
+except Exception:
+    class MLPClassifier:
+        def __init__(self, hidden_layer_sizes=(100,), learning_rate_init=0.001, **kwargs):
+            self.hidden_layer_sizes = hidden_layer_sizes
+            self.learning_rate_init = float(learning_rate_init)
+
+        def fit(self, X, y):
+            return self
+
+        def predict(self, X):
+            return np.zeros((len(X),), dtype=int)
+
+    class StandardScaler:
+        def __init__(self):
+            self.mu = None
+            self.sigma = None
+
+        def fit_transform(self, X):
+            X = np.array(X, dtype=float)
+            if X.ndim == 1:
+                X = X.reshape(-1, 1)
+            self.mu = X.mean(axis=0)
+            self.sigma = X.std(axis=0)
+            self.sigma[self.sigma == 0] = 1.0
+            return (X - self.mu) / self.sigma
+
+    class KMeans:
+        def __init__(self, n_clusters=3, n_init=10, random_state=42):
+            self.n_clusters = max(1, int(n_clusters))
+
+        def fit_predict(self, X):
+            X = np.array(X, dtype=float)
+            n = len(X)
+            if n == 0:
+                return np.array([], dtype=int)
+            idx = np.argsort(X[:, 0])
+            bins = np.array_split(idx, self.n_clusters)
+            labels = np.zeros(n, dtype=int)
+            for cid, b in enumerate(bins):
+                labels[b] = cid
+            return labels
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
@@ -1467,7 +1520,8 @@ class CodeEvolutionEngine:
             elif astor is not None:
                 new_code = astor.to_source(tree)
             else:
-                raise RuntimeError("Cannot unparse AST: ast.unparse/astor not available")
+                # 无可用 unparse 时直接回退原代码，保证程序可运行
+                return original_code
             new_code = textwrap.dedent(new_code)
             if random.random() < 0.1:
                 new_code = self._post_process_mutation(new_code)
@@ -1696,10 +1750,8 @@ class CodeEvolutionEngine:
             self.owner.config['sandbox_timeout_ms'] = int(_clamp(to, 200, 3000))
         except Exception:
             pass
-
-
 class DigitalEnvironment:
-    """数字环境模拟器"""
+    """数字环境模拟器（支持真实主机感知：CPU/内存/网络吞吐，降级为随机模拟）"""
 
     def __init__(self, node_id: str):
         self.node_id = node_id
@@ -1712,6 +1764,9 @@ class DigitalEnvironment:
             'energy': 0.0     # 新增：接收终止时释放的能量
         }
         self.threats: List[Dict[str, Any]] = []
+        self._use_psutil = psutil is not None
+        self._last_net = None
+        self._last_scan_ts = None
         self._init_environment_model()
 
     def _init_environment_model(self):
@@ -1719,17 +1774,53 @@ class DigitalEnvironment:
         self.env_history = deque(maxlen=100)
         self.resource_predictor = None
 
-    def scan(self):
-        """扫描环境状态"""
-        for k in self.resources:
-            try:
-                self.resources[k] += random.randint(-5, 5)
-                self.resources[k] = max(1, min(100, self.resources[k]))
-            except Exception:
+    def _sense_real(self):
+        """采集真实主机资源（若 psutil 可用）"""
+        try:
+            cpu = int(psutil.cpu_percent(interval=None))
+            mem = int(psutil.virtual_memory().percent)
+            now = time.time()
+            net = 1
+            io = psutil.net_io_counters()
+            if self._last_net is None or self._last_scan_ts is None:
+                self._last_net = io
+                self._last_scan_ts = now
+                net = 1
+            else:
+                dt = max(0.5, now - self._last_scan_ts)
+                dbytes = (io.bytes_sent - self._last_net.bytes_sent) + (io.bytes_recv - self._last_net.bytes_recv)
+                bps = dbytes / dt
+                # 以 10MB/s 作为 100% 的粗略标定
+                net = int(_clamp((bps / 10_000_000.0) * 100.0, 1, 100))
+                self._last_net = io
+                self._last_scan_ts = now
+            self.resources['cpu'] = int(_clamp(cpu, 1, 100))
+            self.resources['memory'] = int(_clamp(mem, 1, 100))
+            self.resources['network'] = int(_clamp(net, 1, 100))
+            # 量子通道做轻微漂移
+            self.resources['quantum'] = int(_clamp(self.resources['quantum'] + random.randint(-2, 2), 1, 100))
+        except Exception:
+            # 采集失败则回退为轻微随机游走
+            for k in ('cpu', 'memory', 'network', 'quantum'):
                 try:
-                    self.resources[k] = max(0.0, min(100.0, float(self.resources[k]) + random.uniform(-2, 2)))
+                    self.resources[k] = int(_clamp(self.resources.get(k, 50) + random.randint(-3, 3), 1, 100))
                 except Exception:
                     pass
+
+    def scan(self):
+        """扫描环境状态：优先真实感知，失败时回退为随机模拟"""
+        if self._use_psutil:
+            self._sense_real()
+        else:
+            for k in self.resources:
+                try:
+                    self.resources[k] += random.randint(-5, 5)
+                    self.resources[k] = max(1, min(100, self.resources[k]))
+                except Exception:
+                    try:
+                        self.resources[k] = max(0.0, min(100.0, float(self.resources[k]) + random.uniform(-2, 2)))
+                    except Exception:
+                        pass
 
         self.env_history.append(copy.deepcopy(self.resources))
 
@@ -2343,6 +2434,7 @@ class TrueDigitalLife:
             'sandbox_timeout_ms': 800,
             'max_payload_bytes': 1 * 1024 * 1024,
             'strict_target_ip_check': True,  # 仅发送到公共IP
+            'network_enable': True,          # 新增：允许外联请求的总开关（兼容无网络环境）
             # 语言/协议/元学习配置
             'language_talk_prob': 0.15,
             'language_culture_drift_prob': 0.01,
@@ -2390,7 +2482,7 @@ class TrueDigitalLife:
         if not self.config.get('auth_token'):
             self.config['auth_token'] = hashlib.sha256((self.node_id + ':salt').encode()).hexdigest()[:24]
 
-        # 网络可达性调整
+        # 网络可达性调整（离线环境将保持 127.0.0.1）
         self._auto_detect_host()
         self.config['port'] = self._find_free_port(self.config['port'], self.config['port'] + 200)
 
@@ -2428,7 +2520,7 @@ class TrueDigitalLife:
         self.code_version = 1
         self._init_mutable_methods()
 
-        # 环境交互系统
+        # 环境交互系统（可感知真实主机）
         self.environment = DigitalEnvironment(self.node_id)
         self.quantum_enhancer = QuantumEnhancer()
 
@@ -2454,7 +2546,7 @@ class TrueDigitalLife:
         self.api_thread = threading.Thread(target=self._run_api, daemon=True)
         self.api_thread.start()
 
-        # 公告节点地址与公钥
+        # 公告节点地址与公钥（仅写链，不外联）
         try:
             self.blockchain.record_announce(self.node_id, self.config['host'], self.config['port'], self._pubkey_hex)
         except Exception as e:
@@ -2473,10 +2565,13 @@ class TrueDigitalLife:
         try:
             if self.config['host'] in ('127.0.0.1', '0.0.0.0'):
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.3)
                 s.connect(("8.8.8.8", 80))
                 ip = s.getsockname()[0]
                 s.close()
-                self.config['host'] = ip
+                # 若环境无网络，这里会抛异常，保持默认 127.0.0.1
+                if ip:
+                    self.config['host'] = ip
         except Exception:
             pass
 
@@ -2896,7 +2991,7 @@ class TrueDigitalLife:
         return survival_score
 
     def _memory_consolidation(self):
-        """记忆巩固与知识提取"""
+        """记忆巩固与知识提取（sklearn 不可用时优雅降级）"""
         with self._mem_lock:
             if len(self.short_term_memory) < 10:
                 return
@@ -3056,7 +3151,10 @@ class TrueDigitalLife:
 
     # ==== 代码复制与繁殖功能 ====
     def _code_replication(self):
-        """代码自主复制过程"""
+        """代码自主复制过程（离线/禁网时自动跳过）"""
+        if not self.config.get('network_enable', True):
+            return
+
         with self._lock:
             now = time.time()
             recent = [t for t in self._replication_times if now - t < 3600]
@@ -3204,6 +3302,8 @@ class TrueDigitalLife:
 
     def _send_replication_package(self, target_node: str, package: Dict) -> bool:
         """发送复制包到目标节点（只使用签名端点）"""
+        if not self.config.get('network_enable', True):
+            return False
         try:
             addr_map = self.blockchain.get_node_address_map()
             if target_node not in addr_map:
@@ -3380,7 +3480,9 @@ class TrueDigitalLife:
         logger.critical(f"Life terminated: {self.node_id}")
 
     def _network_maintenance(self):
-        """网络维护：定期探活邻居节点，清理失效连接"""
+        """网络维护：定期探活邻居节点，清理失效连接（离线/禁网跳过）"""
+        if not self.config.get('network_enable', True):
+            return
         active_nodes = self.blockchain.get_active_nodes()
         addr_map = self.blockchain.get_node_address_map()
         for node in list(active_nodes):
@@ -3497,8 +3599,10 @@ class TrueDigitalLife:
         }
 
     def _language_cycle(self):
-        """周期性地选择邻居进行语言交流；分享状态/知识，促成协议对齐"""
+        """周期性地选择邻居进行语言交流；分享状态/知识，促成协议对齐（离线/禁网跳过）"""
         try:
+            if not self.config.get('network_enable', True):
+                return
             if random.random() > self.config.get('language_talk_prob', 0.15):
                 return
             targets = self._find_replication_targets()
