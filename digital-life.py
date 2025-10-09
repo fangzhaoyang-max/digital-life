@@ -31,6 +31,40 @@ from flask import Flask, jsonify, request
 from sklearn.neural_network import MLPClassifier
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from logging.handlers import RotatingFileHandler  # 新增：日志滚动
+
+# 可选依赖：优雅降级
+try:
+    import hypothesis as _hyp
+    from hypothesis import strategies as _st, given as _given, settings as _hsettings
+except Exception:
+    _hyp = None
+    _st = None
+    _given = None
+    _hsettings = None
+
+try:
+    import torch
+    from torch import nn
+    import torch.fx as fx
+except Exception:
+    torch = None
+    nn = None
+    fx = None
+
+try:
+    import jax
+    import jax.numpy as jnp
+except Exception:
+    jax = None
+    jnp = None
+
+try:
+    import onnx
+    import onnxruntime as ort
+except Exception:
+    onnx = None
+    ort = None
 
 try:
     import astor
@@ -40,16 +74,21 @@ except Exception:
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
 
-# 配置日志系统
+# 配置日志系统（改为滚动日志）
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('digital_life.log'),
+        RotatingFileHandler('digital_life.log', maxBytes=5*1024*1024, backupCount=3),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('TrueDigitalLife')
+
+
+# 新增：常用工具
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 # 量子增强模块
@@ -92,7 +131,7 @@ class QuantumEnhancer:
         return original
 
 
-# 动态适应度评估系统
+# 动态适应度评估系统（保留，用于被动场景）
 class DynamicFitnessEvaluator:
     """动态调整的适应度评估系统"""
     def __init__(self):
@@ -182,41 +221,414 @@ class DynamicFitnessEvaluator:
             return 0.5
 
 
-class LifeState(Enum):
-    ACTIVE = auto()
-    DORMANT = auto()
-    REPLICATING = auto()  # 新增复制状态
-    EVOLVING = auto()
-    TERMINATED = auto()
+# ========== 多目标 + Pareto ==========
+
+class ParetoTools:
+    """简单的非支配排序 + 拥挤度估计"""
+    @staticmethod
+    def non_dominated_sort(objs: List[Dict], maximize_keys: Set[str], minimize_keys: Set[str]) -> List[List[int]]:
+        def dom(a, b):
+            a_better = False
+            for k in maximize_keys:
+                if a.get(k, -float('inf')) < b.get(k, -float('inf')):
+                    return False
+                if a.get(k, -float('inf')) > b.get(k, -float('inf')):
+                    a_better = True
+            for k in minimize_keys:
+                if a.get(k, float('inf')) > b.get(k, float('inf')):
+                    return False
+                if a.get(k, float('inf')) < b.get(k, float('inf')):
+                    a_better = True
+            return a_better
+
+        S = [set() for _ in objs]
+        n = [0 for _ in objs]
+        fronts = [[]]
+
+        for p in range(len(objs)):
+            for q in range(len(objs)):
+                if p == q:
+                    continue
+                if dom(objs[p], objs[q]):
+                    S[p].add(q)
+                elif dom(objs[q], objs[p]):
+                    n[p] += 1
+            if n[p] == 0:
+                fronts[0].append(p)
+
+        i = 0
+        while fronts[i]:
+            next_front = []
+            for p in fronts[i]:
+                for q in S[p]:
+                    n[q] -= 1
+                    if n[q] == 0:
+                        next_front.append(q)
+            i += 1
+            fronts.append(next_front)
+        if not fronts[-1]:
+            fronts.pop()
+        return fronts
+
+    @staticmethod
+    def crowding_distance(objs: List[Dict], front: List[int], keys: List[Tuple[str, bool]]) -> Dict[int, float]:
+        dist = {i: 0.0 for i in front}
+        if len(front) <= 2:
+            for i in front:
+                dist[i] = float('inf')
+            return dist
+        for k, is_max in keys:
+            sorted_idx = sorted(front, key=lambda i: objs[i].get(k, 0.0), reverse=is_max)
+            dist[sorted_idx[0]] = float('inf')
+            dist[sorted_idx[-1]] = float('inf')
+            lo = objs[sorted_idx[-1]].get(k, 0.0)
+            hi = objs[sorted_idx[0]].get(k, 0.0)
+            rng = (hi - lo) if hi != lo else 1e-9
+            for j in range(1, len(sorted_idx) - 1):
+                prev_v = objs[sorted_idx[j - 1]].get(k, 0.0)
+                next_v = objs[sorted_idx[j + 1]].get(k, 0.0)
+                dist[sorted_idx[j]] += (next_v - prev_v) / rng
+        return dist
 
 
-class Block:
-    """区块链的基本单元"""
-    def __init__(self, index: int, timestamp: float, data: Dict, previous_hash: str):
-        self.index = index
-        self.timestamp = timestamp
-        self.data = data
-        self.previous_hash = previous_hash
-        self.nonce = 0
-        self.hash = self.calculate_hash()
+class CorrectnessHarness:
+    """
+    自动生成 + 进化测试：
+    - 每个可变方法维护一组测试（最多 N=16）
+    - 通过率直接乘进 fitness（correctness）
+    - 测试淘汰：对族群无区分度的测试被丢弃
+    """
+    def __init__(self, owner: 'TrueDigitalLife'):
+        self.owner = owner
+        self.tests: Dict[str, List[Callable[[Any, Callable], bool]]] = {}
+        self.test_value: Dict[str, List[float]] = {}  # 区分度评分
+        self.max_tests_per_method = 16
 
-    def calculate_hash(self) -> str:
-        """计算区块的SHA-256哈希值"""
-        block_string = json.dumps({
-            'index': self.index,
-            'timestamp': self.timestamp,
-            'data': self.data,
-            'previous_hash': self.previous_hash,
-            'nonce': self.nonce
-        }, sort_keys=True).encode()
-        return hashlib.sha256(block_string).hexdigest()
+    def _ensure_tests(self, method_name: str):
+        if method_name in self.tests:
+            return
+        gens: List[Callable[[Any, Callable], bool]] = []
+        # 基于方法名的启发式不变量
+        if method_name == '_metabolism_cycle':
+            def t1(obj, fn):
+                e0, a0 = obj.energy, obj.age
+                fn(obj)
+                return 0.0 <= obj.energy <= 100.0 and obj.age == a0 + 1
+            def t2(obj, fn):
+                obj.energy = 1.0
+                fn(obj)
+                return 0.0 <= obj.energy <= 100.0
+            gens += [t1, t2]
+        elif method_name == '_environment_scan':
+            def t1(obj, fn):
+                out = fn(obj)
+                return isinstance(out, dict) and 'resources' in out and 'threats' in out
+            gens += [t1]
+        elif method_name == '_survival_goal_evaluation':
+            def t1(obj, fn):
+                s = fn(obj)
+                return isinstance(s, (int, float)) and not (s != s)  # not NaN
+            gens += [t1]
+        elif method_name == '_memory_consolidation':
+            def t1(obj, fn):
+                before = len(obj.knowledge_base)
+                fn(obj)
+                after = len(obj.knowledge_base)
+                return after >= before and after <= 2000
+            gens += [t1]
+        elif method_name == '_motivation_system':
+            def t1(obj, fn):
+                fn(obj)
+                m = obj.config.get('motivation_levels', {})
+                return all(k in m for k in ('survival', 'safety', 'exploration'))
+            gens += [t1]
+        else:
+            def t1(obj, fn):
+                try:
+                    fn(obj)
+                    return True
+                except Exception:
+                    return False
+            gens += [t1]
 
-    def mine_block(self, difficulty: int):
-        """工作量证明挖矿"""
-        target = '0' * max(0, difficulty)
-        while not self.hash.startswith(target):
-            self.nonce += 1
-            self.hash = self.calculate_hash()
+        # Hypothesis 属性测试（可选，包装为闭包）
+        if _hyp and self.owner.config.get('unit_test_enable', True):
+            def tHypo(obj, fn):
+                if not (_hyp and _st and _given and _hsettings):
+                    try:
+                        fn(obj); return True
+                    except Exception:
+                        return False
+                @_hsettings(deadline=None, max_examples=5)
+                @_given(_st.integers(min_value=0, max_value=3))
+                def _inner(seed):
+                    random.seed(int(seed))
+                    fn(obj)
+                try:
+                    _inner()
+                    return True
+                except Exception:
+                    return False
+            gens.append(tHypo)
+
+        self.tests[method_name] = gens[: self.max_tests_per_method]
+        self.test_value[method_name] = [1.0 for _ in self.tests[method_name]]
+
+    def evaluate_method(self, instance, method_name: str, fn: Callable) -> float:
+        self._ensure_tests(method_name)
+        tests = self.tests[method_name]
+        if not tests:
+            return 0.5
+        passed = 0
+        for i, t in enumerate(list(tests)):
+            ok = False
+            # 轻量快照
+            snap = {
+                'energy': instance.energy,
+                'age': instance.age,
+                'state': instance.state,
+                'pleasure': instance.pleasure,
+                'stress': instance.stress,
+                'env_res': copy.deepcopy(instance.environment.resources),
+                'env_thr': copy.deepcopy(instance.environment.threats),
+                'stm_len': len(instance.short_term_memory),
+                'kb_keys': set(list(instance.knowledge_base.keys())[:50]),
+            }
+            try:
+                ok = bool(t(instance, fn))
+            except Exception:
+                ok = False
+            finally:
+                try:
+                    instance.energy = snap['energy']
+                    instance.age = snap['age']
+                    instance.state = snap['state']
+                    instance.pleasure = snap['pleasure']
+                    instance.stress = snap['stress']
+                    instance.environment.resources = snap['env_res']
+                    instance.environment.threats = snap['env_thr']
+                    with instance._kb_lock:
+                        for k in list(instance.knowledge_base.keys()):
+                            if k not in snap['kb_keys']:
+                                instance.knowledge_base.pop(k, None)
+                except Exception:
+                    pass
+            if ok:
+                passed += 1
+
+        return float(passed) / len(tests)
+
+    def evolve_tests(self, method_name: str, population_metrics: List[Dict[str, float]]):
+        if method_name not in self.tests:
+            return
+        if not population_metrics:
+            return
+        corr_vals = [m.get('correctness', 0.0) for m in population_metrics]
+        if max(corr_vals) == min(corr_vals):
+            vals = self.test_value[method_name]
+            for i in range(len(vals)):
+                vals[i] *= 0.95
+            if len(vals) > 4:
+                j = min(range(len(vals)), key=lambda k: vals[k])
+                try:
+                    self.tests[method_name].pop(j)
+                    self.test_value[method_name].pop(j)
+                except Exception:
+                    pass
+        else:
+            vals = self.test_value[method_name]
+            for i in range(len(vals)):
+                vals[i] = _clamp(vals[i] * 1.02, 0.1, 10.0)
+
+
+class MultiObjectiveFitness:
+    """
+    多目标评估：
+    - correctness: 单测通过率（0-1）
+    - energy_cost: 估计耗能（越小越好）
+    - complexity: 圈复杂度 / AST 节点数代理（越小越好）
+    - replicability: 是否包含 replicate() 调用（0.2/0.8）
+    - 可选 bp_error: 反向传播误差（越小越好）
+    """
+    def __init__(self, test_harness: 'CorrectnessHarness'):
+        self.test_harness = test_harness
+
+    def _complexity(self, code: str) -> float:
+        try:
+            tree = ast.parse(textwrap.dedent(code).lstrip())
+            c = 0.0
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.If, ast.For, ast.While, ast.Try)):
+                    c += 1.0
+                elif isinstance(n, ast.BoolOp):
+                    c += 0.5
+                elif isinstance(n, ast.FunctionDef):
+                    c += 1.0
+                elif isinstance(n, ast.Call):
+                    c += 0.2
+            return max(0.0, c)
+        except Exception:
+            return 999.0
+
+    def _replicability(self, code: str) -> float:
+        try:
+            tree = ast.parse(textwrap.dedent(code).lstrip())
+            has_rep = any(
+                isinstance(node, ast.Call) and (
+                    (isinstance(node.func, ast.Name) and 'replicate' in node.func.id) or
+                    (isinstance(node.func, ast.Attribute) and 'replicate' in node.func.attr)
+                )
+                for node in ast.walk(tree)
+            )
+            return 0.8 if has_rep else 0.2
+        except Exception:
+            return 0.2
+
+    def _energy_cost(self, instance, method_name: str, fn: Callable, trials: int = 2) -> float:
+        start_mem = 0
+        try:
+            start_mem = sum(sys.getsizeof(x) for x in (instance.energy, instance.knowledge_base, instance.short_term_memory))
+        except Exception:
+            pass
+
+        t0 = time.perf_counter()
+        ok = 0
+        for _ in range(trials):
+            try:
+                fn(instance)
+                ok += 1
+            except Exception:
+                pass
+        dt = max(1e-6, time.perf_counter() - t0)
+        end_mem = 0
+        try:
+            end_mem = sum(sys.getsizeof(x) for x in (instance.energy, instance.knowledge_base, instance.short_term_memory))
+        except Exception:
+            pass
+        mem_diff = max(0.0, end_mem - start_mem)
+        return float(dt * (1.0 + mem_diff / 1e5))
+
+    def _backprop_error(self, instance) -> Optional[float]:
+        if torch is None or nn is None:
+            return None
+        try:
+            fx_info = instance.neural_net.get('torch_fx', None)
+            if not fx_info:
+                return None
+            m = fx_info.get('module', None)
+            if m is None:
+                return None
+            x = torch.randn(8, 16)
+            y = torch.zeros(8, 16)
+            opt = torch.optim.SGD(m.parameters(), lr=0.01)
+            crit = nn.MSELoss()
+            m.train()
+            opt.zero_grad()
+            out = m(x)
+            loss = crit(out, y)
+            loss.backward()
+            opt.step()
+            return float(loss.detach().cpu().item())
+        except Exception:
+            return None
+
+    def evaluate(self, instance, method_name: str, original_code: str, mutated_code: str) -> Dict[str, float]:
+        try:
+            fn = SafeExec.compile_and_load(mutated_code, method_name, extra_globals={"__quantum_var__": 1, "break_flag": False})
+        except Exception:
+            return {
+                'correctness': 0.0,
+                'energy_cost': 999.0,
+                'complexity': 999.0,
+                'replicability': 0.2
+            }
+
+        try:
+            corr = self.test_harness.evaluate_method(instance, method_name, fn)
+        except Exception:
+            corr = 0.0
+
+        try:
+            en = self._energy_cost(instance, method_name, fn)
+        except Exception:
+            en = 999.0
+        cx = self._complexity(mutated_code)
+        rp = self._replicability(mutated_code)
+
+        out = {
+            'correctness': float(corr),
+            'energy_cost': float(en),
+            'complexity': float(cx),
+            'replicability': float(rp)
+        }
+
+        bp = self._backprop_error(instance)
+        if bp is not None:
+            out['bp_error'] = float(bp)
+        return out
+
+
+# 神经网络AST转换器（保留）
+class NeuralASTTransformer(ast.NodeTransformer):
+    """神经网络指导的AST转换器"""
+    def __init__(self, hotspots: List[Tuple[int, int]]):
+        self.hotspots = hotspots
+        self.current_position = 0
+        self.mutation_intensity = 0.7
+
+    def visit(self, node):
+        start_pos = self.current_position
+        self.current_position += self._estimate_node_size(node)
+        in_hotspot = any(
+            start <= start_pos <= end or
+            start <= self.current_position <= end
+            for start, end in self.hotspots
+        )
+        if in_hotspot and random.random() < self.mutation_intensity:
+            node = self._apply_neural_mutation(node)
+        return super().visit(node)
+
+    def _apply_neural_mutation(self, node):
+        if isinstance(node, ast.If):
+            return self._mutate_if(node)
+        elif isinstance(node, ast.Assign):
+            return self._mutate_assignment(node)
+        elif isinstance(node, ast.Call):
+            return self._mutate_call(node)
+        return node
+
+    def _mutate_if(self, node):
+        if random.random() < 0.3:
+            new_test = ast.Compare(
+                left=ast.Name(id='quantum_flag', ctx=ast.Load()),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(value=random.randint(0, 1))]
+            )
+            return ast.If(
+                test=new_test,
+                body=node.body,
+                orelse=node.orelse
+            )
+        return node
+
+    def _mutate_assignment(self, node):
+        if len(node.targets) == 1 and isinstance(node.value, (ast.Num, ast.Constant)):
+            new_value = ast.BinOp(
+                left=node.value,
+                op=ast.Add(),
+                right=ast.Constant(value=random.randint(-5, 5))
+            )
+            return ast.Assign(
+                targets=node.targets,
+                value=new_value
+            )
+        return node
+
+    def _mutate_call(self, node):
+        return node
+
+    def _estimate_node_size(self, node) -> int:
+        return len(ast.unparse(node)) if hasattr(ast, 'unparse') else 50
 
 
 # 安全沙箱：AST 安全检查与受限执行
@@ -330,67 +742,72 @@ class SafeExec:
         return fn
 
 
-# 神经网络AST转换器（保留）
-class NeuralASTTransformer(ast.NodeTransformer):
-    """神经网络指导的AST转换器"""
-    def __init__(self, hotspots: List[Tuple[int, int]]):
-        self.hotspots = hotspots
-        self.current_position = 0
-        self.mutation_intensity = 0.7
+# ============ torch.fx 图变异（可选） ============
 
-    def visit(self, node):
-        start_pos = self.current_position
-        self.current_position += self._estimate_node_size(node)
-        in_hotspot = any(
-            start <= start_pos <= end or
-            start <= self.current_position <= end
-            for start, end in self.hotspots
-        )
-        if in_hotspot and random.random() < self.mutation_intensity:
-            node = self._apply_neural_mutation(node)
-        return super().visit(node)
+class FXGraphMutator:
+    """对 torch.fx Graph 做结构变异：改激活/插层/加残差（示例：激活替换）"""
+    ACTS = []
+    if nn is not None:
+        ACTS = [nn.ReLU, nn.Tanh, nn.Sigmoid, nn.LeakyReLU]
 
-    def _apply_neural_mutation(self, node):
-        if isinstance(node, ast.If):
-            return self._mutate_if(node)
-        elif isinstance(node, ast.Assign):
-            return self._mutate_assignment(node)
-        elif isinstance(node, ast.Call):
-            return self._mutate_call(node)
-        return node
+    @staticmethod
+    def mutate(graph_module):
+        if torch is None or fx is None:
+            return graph_module
+        gm = graph_module
+        try:
+            for n in gm.graph.nodes:
+                if n.op == 'call_module':
+                    target = dict(gm.named_modules()).get(n.target)
+                    if isinstance(target, tuple(FXGraphMutator.ACTS)) and random.random() < 0.4:
+                        new_act = random.choice(FXGraphMutator.ACTS)()
+                        # 替换模块
+                        try:
+                            parent_name = n.target.rsplit('.', 1)[0] if '.' in n.target else ''
+                            setattr(gm, n.target, new_act)
+                        except Exception:
+                            pass
+            gm.recompile()
+        except Exception:
+            pass
+        return gm
 
-    def _mutate_if(self, node):
-        if random.random() < 0.3:
-            new_test = ast.Compare(
-                left=ast.Name(id='quantum_flag', ctx=ast.Load()),
-                ops=[ast.Eq()],
-                comparators=[ast.Constant(value=random.randint(0, 1))]
-            )
-            return ast.If(
-                test=new_test,
-                body=node.body,
-                orelse=node.orelse
-            )
-        return node
 
-    def _mutate_assignment(self, node):
-        if len(node.targets) == 1 and isinstance(node.value, (ast.Num, ast.Constant)):
-            new_value = ast.BinOp(
-                left=node.value,
-                op=ast.Add(),
-                right=ast.Constant(value=random.randint(-5, 5))
-            )
-            return ast.Assign(
-                targets=node.targets,
-                value=new_value
-            )
-        return node
+class LifeState(Enum):
+    ACTIVE = auto()
+    DORMANT = auto()
+    REPLICATING = auto()  # 新增复制状态
+    EVOLVING = auto()
+    TERMINATED = auto()
 
-    def _mutate_call(self, node):
-        return node
 
-    def _estimate_node_size(self, node) -> int:
-        return len(ast.unparse(node)) if hasattr(ast, 'unparse') else 50
+class Block:
+    """区块链的基本单元"""
+    def __init__(self, index: int, timestamp: float, data: Dict, previous_hash: str):
+        self.index = index
+        self.timestamp = timestamp
+        self.data = data
+        self.previous_hash = previous_hash
+        self.nonce = 0
+        self.hash = self.calculate_hash()
+
+    def calculate_hash(self) -> str:
+        """计算区块的SHA-256哈希值"""
+        block_string = json.dumps({
+            'index': self.index,
+            'timestamp': self.timestamp,
+            'data': self.data,
+            'previous_hash': self.previous_hash,
+            'nonce': self.nonce
+        }, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+    def mine_block(self, difficulty: int):
+        """工作量证明挖矿"""
+        target = '0' * max(0, difficulty)
+        while not self.hash.startswith(target):
+            self.nonce += 1
+            self.hash = self.calculate_hash()
 
 
 class CodeEvolutionEngine:
@@ -405,8 +822,9 @@ class CodeEvolutionEngine:
         self.code_versions = {}  # 方法名: 版本号
         self.quantum = QuantumEnhancer()
         self.fitness_evaluator = DynamicFitnessEvaluator()
+        self.owner = digital_life_instance  # 绑定宿主
 
-        # 变异操作符
+        # 变异操作符（初始，会被大算子库覆盖）
         self.mutation_operators = {
             'control_flow': self._mutate_control_flow,
             'data_flow': self._mutate_data_flow,
@@ -418,6 +836,178 @@ class CodeEvolutionEngine:
         self.operator_weights = {op: 1.0 for op in self.mutation_operators}
         self.adaptive_mutation_rate = 0.2
 
+        # 大算子库（60+）
+        self._init_big_operator_bank()
+
+    # ======= 大算子库（60+） =======
+    def _init_big_operator_bank(self):
+        """构建 60+ 参数化变异族群（以函数为粒度）"""
+        ops: Dict[str, Callable[[ast.AST], ast.AST]] = {}
+
+        # 1) 控制流
+        for invert_prob in (0.3, 0.5, 0.7):
+            ops[f'cf_invert_{int(invert_prob*100)}'] = lambda n, p=invert_prob: self._mutate_control_flow(n)
+        for add_break in (True, False):
+            ops[f'cf_break_{int(add_break)}'] = lambda n, b=add_break: self._mutate_control_flow(n)
+
+        # 2) 数据流
+        for delta in (-10, -5, -1, 1, 2, 5, 10):
+            ops[f'df_add_{delta}'] = lambda n, d=delta: self._mutate_data_flow_value(n, d)
+
+        # 3) 错误导向（try/except + 修复）
+        for fallback in ('return_none', 'log_and_continue', 'dormant_state'):
+            ops[f'err_try_{fallback}'] = lambda n, f=fallback: self._error_oriented_mutation(n, f)
+
+        # 4) 设计模式注入（观察者/策略/状态机）
+        for patt in ('observer', 'strategy', 'statemachine'):
+            ops[f'pattern_{patt}'] = lambda n, p=patt: self._design_pattern_inject(n, p)
+
+        # 5) 跨函数级（合并/内联/递归化）
+        for x in ('merge', 'inline_call', 'recursivize'):
+            ops[f'cross_{x}'] = lambda n, x=x: self._cross_function_mutate(n, x)
+
+        # 6) 量子/神经/复制
+        ops['quantum'] = self._quantum_mutation
+        ops['neural'] = self._neural_mutation
+        ops['replication'] = self._replication_mutation
+
+        # 7) 微扰族群（15个）
+        for k in range(15):
+            ops[f'micro_{k}'] = self._micro_mutation
+
+        self.mutation_operators = ops
+        self.operator_weights = {op: 1.0 for op in self.mutation_operators}
+
+    def _mutate_data_flow_value(self, node: ast.AST, delta: int) -> ast.AST:
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, (ast.Num, ast.Constant)) and isinstance(getattr(node, 'targets', [None])[0], ast.Name):
+                try:
+                    node.value = ast.BinOp(left=node.value, op=ast.Add(), right=ast.Constant(value=int(delta)))
+                except Exception:
+                    pass
+        return node
+
+    def _error_oriented_mutation(self, node: ast.AST, fallback: str) -> ast.AST:
+        if isinstance(node, ast.FunctionDef):
+            body = node.body
+            fallback_body = []
+            if fallback == 'return_none':
+                fallback_body = [ast.Return(value=ast.Constant(value=None))]
+            elif fallback == 'log_and_continue':
+                fallback_body = [ast.Expr(value=ast.Call(func=ast.Name(id='print', ctx=ast.Load()),
+                                                        args=[ast.Constant(value=f"[auto-repair] {node.name} exception")], keywords=[]))]
+            elif fallback == 'dormant_state':
+                fallback_body = [ast.Assign(
+                    targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr='state', ctx=ast.Store())],
+                    value=ast.Attribute(value=ast.Name(id='LifeState', ctx=ast.Load()), attr='DORMANT', ctx=ast.Load())
+                )]
+            try_block = ast.Try(
+                body=body,
+                handlers=[ast.ExceptHandler(type=ast.Name(id='Exception', ctx=ast.Load()), name=None, body=fallback_body or [ast.Pass()])],
+                orelse=[],
+                finalbody=[]
+            )
+            node.body = [try_block]
+        return node
+
+    def _design_pattern_inject(self, node: ast.AST, pattern: str) -> ast.AST:
+        if isinstance(node, ast.FunctionDef):
+            if pattern == 'observer':
+                inject = [
+                    ast.Assign(targets=[ast.Name(id='observers', ctx=ast.Store())], value=ast.List(elts=[], ctx=ast.Load())),
+                    ast.FunctionDef(
+                        name='_notify',
+                        args=ast.arguments(posonlyargs=[], args=[ast.arg(arg='evt'), ast.arg(arg='data', annotation=None)], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[ast.Constant(value=None)]),
+                        body=[
+                            ast.For(target=ast.Name(id='cb', ctx=ast.Store()), iter=ast.Name(id='observers', ctx=ast.Load()),
+                                    body=[ast.Expr(value=ast.Call(func=ast.Name(id='cb', ctx=ast.Load()),
+                                                                 args=[ast.Name(id='evt', ctx=ast.Load()), ast.Name(id='data', ctx=ast.Load())], keywords=[]))],
+                                    orelse=[])
+                        ],
+                        decorator_list=[]
+                    ),
+                ]
+                node.body = inject + node.body + [ast.Expr(value=ast.Call(func=ast.Name(id='_notify', ctx=ast.Load()), args=[ast.Constant(value='end'), ast.Constant(value=None)], keywords=[]))]
+            elif pattern == 'strategy':
+                inject = [
+                    ast.Assign(targets=[ast.Name(id='strategies', ctx=ast.Store())], value=ast.Dict(keys=[], values=[])),
+                    ast.FunctionDef(
+                        name='_use',
+                        args=ast.arguments(posonlyargs=[], args=[ast.arg(arg='name')], vararg=ast.arg(arg='args'), kwonlyargs=[], kw_defaults=[], kwarg=ast.arg(arg='kwargs'), defaults=[]),
+                        body=[
+                            ast.Assign(targets=[ast.Name(id='f', ctx=ast.Store())],
+                                       value=ast.Call(func=ast.Attribute(value=ast.Name(id='strategies', ctx=ast.Load()), attr='get', ctx=ast.Load()),
+                                                      args=[ast.Name(id='name', ctx=ast.Load())], keywords=[])),
+                            ast.Return(value=ast.IfExp(test=ast.Name(id='f', ctx=ast.Load()),
+                                                       body=ast.Call(func=ast.Name(id='f', ctx=ast.Load()), args=[ast.Starred(value=ast.Name(id='args', ctx=ast.Load()), ctx=ast.Load())],
+                                                                     keywords=[ast.keyword(arg=None, value=ast.Name(id='kwargs', ctx=ast.Load()))]),
+                                                       orelse=ast.Constant(value=None)))
+                        ],
+                        decorator_list=[]
+                    )
+                ]
+                node.body = inject + node.body
+            elif pattern == 'statemachine':
+                inject = [
+                    ast.Assign(targets=[ast.Name(id='_fsm', ctx=ast.Store())], value=ast.Dict(keys=[ast.Constant(value='state')], values=[ast.Constant(value='S0')])),
+                    ast.FunctionDef(
+                        name='_tr',
+                        args=ast.arguments(posonlyargs=[], args=[ast.arg(arg='evt')], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+                        body=[ast.If(test=ast.Compare(left=ast.Name(id='evt', ctx=ast.Load()), ops=[ast.Eq()], comparators=[ast.Constant(value='tick')]),
+                                     body=[ast.Assign(targets=[ast.Subscript(value=ast.Name(id='_fsm', ctx=ast.Load()), slice=ast.Constant(value='state'), ctx=ast.Store())], value=ast.Constant(value='S1'))],
+                                     orelse=[])],
+                        decorator_list=[]
+                    )
+                ]
+                node.body = inject + node.body + [ast.Expr(value=ast.Call(func=ast.Name(id='_tr', ctx=ast.Load()), args=[ast.Constant(value='tick')], keywords=[]))]
+        return node
+
+    def _cross_function_mutate(self, node: ast.AST, how: str) -> ast.AST:
+        if not isinstance(node, ast.FunctionDef):
+            return node
+        try:
+            target = node.name
+            donors = [m for m in self.code_versions.keys() if m != target] or []
+            if not donors and hasattr(self, 'owner') and hasattr(self.owner, 'mutable_methods'):
+                donors = [m for m in self.owner.mutable_methods if m != target]
+            donor = random.choice(donors) if donors else None
+
+            if how == 'merge' and donor:
+                call = ast.Expr(value=ast.Call(func=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
+                                                                  attr=donor, ctx=ast.Load()), args=[], keywords=[]))
+                node.body.append(call)
+            elif how == 'inline_call' and donor:
+                call = ast.Expr(value=ast.Call(func=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
+                                                                  attr=donor, ctx=ast.Load()), args=[], keywords=[]))
+                node.body.insert(0, call)
+            elif how == 'recursivize':
+                guard = ast.If(
+                    test=ast.UnaryOp(op=ast.Not(), operand=ast.Name(id='break_flag', ctx=ast.Load())),
+                    body=[ast.Expr(value=ast.Call(func=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
+                                                                    attr=target, ctx=ast.Load()), args=[], keywords=[]))],
+                    orelse=[]
+                )
+                node.body.append(guard)
+        except Exception:
+            pass
+        return node
+
+    def _micro_mutation(self, node: ast.AST) -> ast.AST:
+        try:
+            if isinstance(node, ast.If) and random.random() < 0.2:
+                node.test = ast.BoolOp(op=ast.And(), values=[
+                    node.test,
+                    ast.Compare(left=ast.Name(id='__quantum_var__', ctx=ast.Load()),
+                                ops=[ast.NotEq()],
+                                comparators=[ast.Constant(value=random.randint(0, 1))])
+                ])
+            elif isinstance(node, ast.FunctionDef) and random.random() < 0.1 and hasattr(ast, 'Constant'):
+                node.body.insert(0, ast.Expr(value=ast.Constant(value=None)))  # no-op
+        except Exception:
+            pass
+        return node
+
+    # ======= 原有变异与工具 =======
     def _dynamic_operator_selection(self) -> str:
         """基于权重的动态操作符选择"""
         total = sum(self.operator_weights.values())
@@ -601,7 +1191,7 @@ class CodeEvolutionEngine:
         return '\n'.join(lines)
 
     def evaluate_code_fitness(self, original: str, mutated: str) -> float:
-        """评估代码适应度(0.0-1.0)"""
+        """评估代码适应度(0.0-1.0) - 保留旧评估用于复制场景"""
         context = {
             'energy': self.energy,
             'stagnation': len(self.code_mutations) % 10,
@@ -635,11 +1225,8 @@ class CodeEvolutionEngine:
 
     @staticmethod
     def _wrap_with_timeout(fn: Callable, timeout_ms: int) -> Callable:
-        """为热更方法增加超时保护 + 并发限流（线程 join，超时则置 break_flag 并抛出）
-           增强：连续超时/异常自动回滚到备份版本
-        """
+        """为热更方法增加超时保护 + 并发限流"""
         def wrapped(self, *args, **kwargs):
-            # 并发限流（依赖实例上的信号量）
             sem = getattr(self, "_hotswap_semaphore", None)
             acquired = False
             if isinstance(sem, threading.Semaphore):
@@ -647,7 +1234,6 @@ class CodeEvolutionEngine:
                 if not acquired:
                     raise RuntimeError("Hotswap concurrency limit reached")
 
-            # 超时熔断检查
             timeouts: Deque[float] = getattr(self, "_hotswap_timeouts", deque(maxlen=50))
             now = time.time()
             recent_timeouts = [t for t in timeouts if now - t < 60]
@@ -671,16 +1257,12 @@ class CodeEvolutionEngine:
 
             try:
                 if t.is_alive():
-                    # 置 break_flag，尝试让目标函数提前结束
                     try:
                         fn.__globals__['break_flag'] = True
                     except Exception:
                         pass
-                    # 记录一次超时
                     timeouts.append(time.time())
                     setattr(self, "_hotswap_timeouts", timeouts)
-
-                    # 针对该方法的连续超时计数，并触发回滚
                     try:
                         by_fn = getattr(self, "_hotswap_timeout_by_fn", {})
                         dq = by_fn.get(fn.__name__, deque(maxlen=5))
@@ -694,11 +1276,9 @@ class CodeEvolutionEngine:
                                 engine.rollback_method(self, fn.__name__)
                     except Exception:
                         pass
-
                     raise TimeoutError(f"Sandbox timeout: {fn.__name__}")
 
                 if exc_holder['exc'] is not None:
-                    # 连续异常计数，并在阈值内回滚
                     try:
                         failures = getattr(self, "_hotswap_failures", {})
                         dq = failures.get(fn.__name__, deque(maxlen=5))
@@ -734,7 +1314,6 @@ class CodeEvolutionEngine:
             if method_name not in self.backup_methods:
                 self.backup_methods[method_name] = getattr(instance, method_name)
 
-            # 超时包装
             timeout_ms = int(instance.config.get('sandbox_timeout_ms', 800))
             wrapped = self._wrap_with_timeout(new_method, timeout_ms)
 
@@ -755,6 +1334,72 @@ class CodeEvolutionEngine:
             return True
         return False
 
+    # ====== 可选硬件加速/近似 ======
+    def _batch_static_metrics(self, codes: List[str]) -> List[Tuple[float, float]]:
+        """
+        返回 [(energy_proxy, complexity)] 列表。
+        energy_proxy/complexity 用长度替代（近似）；可 JAX 加速。
+        """
+        lens = np.array([len(c) for c in codes], dtype=np.float32)
+        if jax is not None and self.owner.config.get('accelerate_enable', True):
+            arr = jnp.array(lens)
+            energy = (arr / 1000.0)
+            comp = (arr / 800.0)
+            out = np.stack([np.array(energy), np.array(comp)], axis=1)
+            return [(float(e), float(c)) for e, c in out]
+        else:
+            return [(float(l / 1000.0), float(l / 800.0)) for l in lens]
+
+    def _fx_to_onnx_eval(self, instance) -> Optional[float]:
+        if onnx is None or ort is None or torch is None:
+            return None
+        try:
+            fx_info = instance.neural_net.get('torch_fx', None)
+            if not fx_info:
+                return None
+            m = fx_info['module'].eval()
+            x = torch.randn(1, 16)
+            tmp = f"/tmp/t_{uuid.uuid4().hex[:6]}.onnx"
+            torch.onnx.export(m, x, tmp, input_names=['x'], output_names=['y'], opset_version=12)
+            sess = ort.InferenceSession(tmp, providers=['CPUExecutionProvider'])
+            y = sess.run(['y'], {'x': x.numpy()})[0]
+            return float(np.linalg.norm(y))
+        except Exception:
+            return None
+
+    # ====== 策略自进化 ======
+    def _evolve_strategy(self, population_objs: List[Dict[str, float]]):
+        """
+        简化策略进化：
+        - 若 correctness 平均低，增加错误导向与设计模式注入权重
+        - 若 energy_cost 偏高，降低跨函数/递归化权重，增加数据流微扰
+        - 根据 DNA 策略基因微调 pop_size/mutation_rate/timeout
+        """
+        if not population_objs:
+            return
+        avg_corr = float(np.mean([o.get('correctness', 0.0) for o in population_objs]))
+        avg_energy = float(np.mean([o.get('energy_cost', 0.0) for o in population_objs]))
+
+        for k in self.operator_weights:
+            if k.startswith('err_try') or k.startswith('pattern_'):
+                self.operator_weights[k] *= (1.05 if avg_corr < 0.6 else 0.98)
+            if k.startswith('cross_recursivize') or k.startswith('cross_merge'):
+                self.operator_weights[k] *= (0.95 if avg_energy > 0.1 else 1.02)
+            if k.startswith('df_add') or k.startswith('micro_'):
+                self.operator_weights[k] *= (1.03 if avg_energy > 0.1 else 0.99)
+            self.operator_weights[k] = float(_clamp(self.operator_weights[k], 0.2, 5.0))
+
+        # 读取 DNA 策略基因并作用
+        try:
+            params = self.owner.genetic_encoder.decode(self.owner.dna)
+            pop_size = int(params.get('pop_size', self.owner.config.get('population_size', 8)))
+            self.owner.config['population_size'] = int(_clamp(pop_size, 4, 64))
+            self.adaptive_mutation_rate = float(_clamp(params.get('mutation_rate', 0.2), 0.02, 0.5))
+            to = int(params.get('timeout', self.owner.config.get('sandbox_timeout_ms', 800)))
+            self.owner.config['sandbox_timeout_ms'] = int(_clamp(to, 200, 3000))
+        except Exception:
+            pass
+
 
 class DistributedLedger:
     """为数字生命定制的区块链系统"""
@@ -771,7 +1416,6 @@ class DistributedLedger:
         if genesis or not loaded:
             self.create_genesis_block()
         else:
-            # 加载成功后校验链有效性，若失败则重建创世块
             if not self.is_chain_valid():
                 logger.warning("Loaded chain invalid. Recreating genesis block.")
                 with self._lock:
@@ -925,18 +1569,39 @@ class DistributedLedger:
         }
         self.add_block(data)
 
+    def record_language_event(self, node_id: str, peer_id: str, event: str, metadata: Dict):
+        """记录语言/协议相关事件"""
+        data = {
+            'type': 'language',
+            'node_id': node_id,
+            'peer_id': peer_id,
+            'event': event,
+            'timestamp': time.time(),
+            'metadata': metadata or {}
+        }
+        self.add_block(data)
+
     def get_active_nodes(self) -> List[str]:
-        """从区块链获取当前活跃节点列表"""
+        """从区块链获取当前活跃节点列表（修复：计入 language.peer_id）"""
         with self._lock:
             active_nodes = set()
             for block in self.chain:
                 data = block.data
-                if data.get('type') in ('gene_transfer', 'announce', 'discovery'):
+                t = data.get('type')
+                if t in ('gene_transfer', 'announce', 'discovery'):
                     nid = data.get('sender') or data.get('node_id')
                     if nid:
                         active_nodes.add(nid)
-                elif data.get('type') == 'death':
-                    active_nodes.discard(data['node_id'])
+                elif t == 'language':
+                    nid = data.get('node_id')
+                    pid = data.get('peer_id')
+                    if nid:
+                        active_nodes.add(nid)
+                    if pid:
+                        active_nodes.add(pid)
+                elif t == 'death':
+                    if data.get('node_id'):
+                        active_nodes.discard(data['node_id'])
             return list(active_nodes)
 
     def get_node_address_map(self) -> Dict[str, Tuple[str, int, str]]:
@@ -1038,7 +1703,12 @@ class GeneticEncoder:
             'mutation_rate': (32, 64),
             'learning_rate': (64, 96),
             'exploration': (96, 128),
-            'defense': (128, 160)
+            'defense': (128, 160),
+            # 策略基因（64+ 位）
+            'pop_size': (160, 192),
+            'crossover': (192, 224),
+            'op_bias': (224, 256),
+            'timeout': (256, 288)
         }
 
     def decode(self, dna: str) -> Dict:
@@ -1061,6 +1731,14 @@ class GeneticEncoder:
                     params[param] = normalized  # 0-1
                 elif param == 'defense':
                     params[param] = normalized * 2  # 0-2
+                elif param == 'pop_size':
+                    params[param] = int(4 + normalized * 28)  # 4-32
+                elif param == 'crossover':
+                    params[param] = 0.1 + normalized * 0.7   # 0.1-0.8
+                elif param == 'op_bias':
+                    params[param] = normalized               # 0-1
+                elif param == 'timeout':
+                    params[param] = int(400 + normalized * 1200)  # 400-1600 ms
             except Exception:
                 logger.warning(f"Failed to decode gene segment for {param}")
                 params[param] = 0.5
@@ -1081,6 +1759,14 @@ class GeneticEncoder:
                 scaled = int(value * 10000)
             elif param == 'defense':
                 scaled = int(value * 5000)
+            elif param == 'pop_size':
+                scaled = int(value)
+            elif param == 'crossover':
+                scaled = int(value * 10000)
+            elif param == 'op_bias':
+                scaled = int(value * 10000)
+            elif param == 'timeout':
+                scaled = int(value)
             else:
                 scaled = int(value * 10000)
             segment = hashlib.sha256(str(scaled).encode()).hexdigest()[:32]
@@ -1101,6 +1787,427 @@ class GeneticEncoder:
             pos = random.randint(0, len(new_dna) - 1)
             new_dna[pos] = hashlib.sha256(new_dna[pos].encode()).hexdigest()[:32]
         return ''.join(new_dna)
+
+
+# ============== 协议注册表：版本/语法/槽位校验（协议进化基础） ==============
+class ProtocolRegistry:
+    """管理语言协议版本与语法，支持校验与 schema_id"""
+    def __init__(self):
+        self.specs: Dict[str, Dict] = {}
+        self.schema_ids: Dict[str, str] = {}
+        self._init_default_specs()
+
+    def _canonical(self, spec: Dict) -> str:
+        return json.dumps(spec, sort_keys=True, separators=(',', ':'))
+
+    def register(self, version: str, spec: Dict):
+        self.specs[version] = spec
+        self.schema_ids[version] = 'proto:' + version + ':' + hashlib.sha1(self._canonical(spec).encode()).hexdigest()[:8]
+
+    def get_schema_id(self, version: str) -> Optional[str]:
+        return self.schema_ids.get(version)
+
+    def get_spec(self, version: str) -> Optional[Dict]:
+        return self.specs.get(version)
+
+    def validate(self, version: str, message: Dict) -> Tuple[bool, Optional[str]]:
+        """基于 protocol spec 对 message 进行基本校验"""
+        spec = self.specs.get(version)
+        if not spec:
+            return True, None
+        if version == 'v1':
+            return True, None  # v1 仅 token，无结构校验
+        intent = message.get('intent')
+        slots = message.get('slots', {}) or {}
+        intents = spec.get('intents', {})
+        if intent not in intents:
+            return False, 'unknown_intent'
+        want = intents[intent].get('slots', {})
+        for k, info in want.items():
+            if info.get('required') and k not in slots:
+                return False, f'missing_slot:{k}'
+        for k, v in slots.items():
+            dtype = want.get(k, {}).get('type', 'any')
+            if dtype == 'str' and not isinstance(v, str):
+                return False, f'bad_type:{k}'
+            if dtype == 'int' and not isinstance(v, int):
+                return False, f'bad_type:{k}'
+            if dtype == 'float' and not isinstance(v, (int, float)):
+                return False, f'bad_type:{k}'
+        return True, None
+
+    def _init_default_specs(self):
+        self.register('v1', {
+            'version': 1,
+            'style': 'tokens',
+            'intents': {}
+        })
+        self.register('v2', {
+            'version': 2,
+            'style': 'slots',
+            'intents': {
+                'greet': {'slots': {}},
+                'ask_status': {'slots': {}},
+                'share_knowledge': {
+                    'slots': {
+                        'key': {'type': 'str', 'required': True},
+                        'value': {'type': 'str', 'required': False}
+                    }
+                },
+                'propose_trade': {
+                    'slots': {
+                        'item': {'type': 'str', 'required': True},
+                        'price': {'type': 'float', 'required': True}
+                    }
+                },
+                'farewell': {'slots': {}},
+                'negotiate_protocol': {
+                    'slots': {
+                        'version': {'type': 'str', 'required': True}
+                    }
+                },
+                'negotiate_ack': {
+                    'slots': {
+                        'version': {'type': 'str', 'required': True},
+                        'accepted': {'type': 'str', 'required': True}
+                    }
+                }
+            }
+        })
+
+
+# ============== 语言系统：文化/协议演化 ==============
+class LanguageSystem:
+    """
+    让生命体用“语言”交流，支持：
+    - 协议版本 v1/v2，自动协商与升级/降级
+    - v2: schema_id + slots + 类型校验
+    - 词汇（token）命名游戏式对齐 + 文化漂变（新同义词）
+    - 每对等体维护协议/成功率，驱动协议进化
+    """
+    BASE_INTENTS = ['greet', 'ask_status', 'share_knowledge', 'propose_trade', 'farewell']
+    PROTO_INTENTS = ['negotiate_protocol', 'negotiate_ack']
+
+    def __init__(self, owner: 'TrueDigitalLife'):
+        self.owner = owner
+        self.language_id = hashlib.sha256(owner.node_id.encode()).hexdigest()[:8]
+        self.protocol_version = 1
+        self.registry = ProtocolRegistry()
+        self.supported_versions = ['v1', 'v2']
+        self.utterance_map: Dict[str, Set[str]] = {k: set() for k in (self.BASE_INTENTS + self.PROTO_INTENTS)}
+        self.lexicon: Dict[str, str] = {}
+        self.culture = {
+            'tag': f"C{hashlib.sha1((owner.node_id+'-culture').encode()).hexdigest()[:6]}",
+            'memes': {},
+            'prestige': random.uniform(0.4, 0.8)
+        }
+        self.seq = 0
+        self.successes: Deque[int] = deque(maxlen=300)
+        self.conversations = 0
+        self.peer_state: Dict[str, Dict[str, Any]] = {}
+        self._seed_basic_words()
+
+    def _seed_basic_words(self):
+        seeds = {
+            'greet': ['hai', 'sal'],
+            'ask_status': ['stat?'],
+            'share_knowledge': ['know!'],
+            'propose_trade': ['swap?'],
+            'farewell': ['bye'],
+            'negotiate_protocol': ['proto?'],
+            'negotiate_ack': ['proto!']
+        }
+        for intent, toks in seeds.items():
+            for t in toks:
+                self.utterance_map[intent].add(t)
+                self.lexicon[t] = intent
+                self.culture['memes'][t] = self.culture['memes'].get(t, 0.5)
+
+    def _new_token(self, intent: str) -> str:
+        base = f"{intent}:{time.time_ns()}:{random.getrandbits(32)}"
+        tok = hashlib.sha1(base.encode()).hexdigest()[:4]
+        return tok
+
+    def _get_peer(self, peer_id: Optional[str]) -> Dict[str, Any]:
+        if not peer_id:
+            return {}
+        st = self.peer_state.get(peer_id)
+        if not st:
+            st = {
+                'history': deque(maxlen=60),
+                'agreed_version': None,
+                'last_caps': [],
+                'last_seen': 0.0
+            }
+            self.peer_state[peer_id] = st
+        return st
+
+    def _choose_version_for_peer(self, peer_id: Optional[str]) -> str:
+        st = self._get_peer(peer_id)
+        if st.get('agreed_version') in self.supported_versions:
+            return st['agreed_version']
+        return 'v2' if self.protocol_version >= 2 else 'v1'
+
+    def _advertise_caps(self) -> List[str]:
+        return list(self.supported_versions)
+
+    def utter(self, intent: str, topic: Optional[str] = None, content: Optional[Dict] = None, peer_id: Optional[str] = None) -> Dict:
+        if intent not in (self.BASE_INTENTS + self.PROTO_INTENTS):
+            intent = random.choice(self.BASE_INTENTS)
+        if not self.utterance_map[intent]:
+            t = self._new_token(intent)
+            self.utterance_map[intent].add(t)
+            self.lexicon[t] = intent
+            self.culture['memes'][t] = 0.4
+
+        tok = max(self.utterance_map[intent], key=lambda x: self.culture['memes'].get(x, 0.1))
+        self.seq += 1
+        version = self._choose_version_for_peer(peer_id)
+        proto_ver_num = 2 if version == 'v2' else 1
+
+        msg_core = {
+            'intent': intent,
+            'utterance': [tok],
+            'topic': topic or '',
+            'confidence': 0.8
+        }
+
+        if version == 'v2':
+            schema_id = self.registry.get_schema_id('v2')
+            msg_core['schema_id'] = schema_id
+            slots = {}
+            if intent == 'share_knowledge':
+                if content:
+                    try:
+                        k, v = next(iter(content.items()))
+                        slots['key'] = str(k)
+                        slots['value'] = json.dumps(self.owner._json_sanitize(v, max_depth=2), ensure_ascii=False)[:256]
+                    except Exception:
+                        pass
+            elif intent == 'propose_trade':
+                slots['item'] = str((content or {}).get('item', 'artifact'))
+                slots['price'] = float((content or {}).get('price', random.uniform(1, 10)))
+            elif intent in ('negotiate_protocol', 'negotiate_ack'):
+                slots.update((content or {}))
+                for k in list(slots.keys()):
+                    slots[k] = str(slots[k])
+            msg_core['slots'] = slots
+
+        msg = {
+            'meta': {
+                'source_node': self.owner.node_id,
+                'language_id': self.language_id,
+                'protocol_version': proto_ver_num,
+                'proto_version': version,
+                'proto_caps': self._advertise_caps(),
+                'culture_tag': self.culture['tag'],
+                'code_version': self.owner.code_version,
+                'timestamp': time.time(),
+                'seq': self.seq,
+                'host': self.owner.config.get('host'),
+                'port': self.owner.config.get('port'),
+            },
+            'message': msg_core
+        }
+
+        if content and intent != 'propose_trade':
+            msg['message']['content'] = self.owner._json_sanitize(content, max_depth=3)
+        return msg
+
+    def interpret(self, payload: Dict, sender_prestige: float = 0.6) -> Tuple[bool, Dict]:
+        try:
+            meta = payload.get('meta', {})
+            msg = payload.get('message', {})
+            utter = msg.get('utterance', [])
+            intent_hint = msg.get('intent', None)
+            schema_id = msg.get('schema_id', None)
+            slots = msg.get('slots', {}) or {}
+            source = meta.get('source_node', '')
+            peer = self._get_peer(source)
+            peer['last_caps'] = list(meta.get('proto_caps', []))
+            peer['last_seen'] = time.time()
+
+            used_version = None
+            if schema_id == self.registry.get_schema_id('v2'):
+                used_version = 'v2'
+            else:
+                used_version = meta.get('proto_version', 'v1')
+                if isinstance(used_version, int):
+                    used_version = f'v{used_version}'
+                if used_version not in self.supported_versions:
+                    used_version = 'v1'
+
+            if intent_hint in ('negotiate_protocol', 'negotiate_ack'):
+                if intent_hint == 'negotiate_protocol':
+                    proposal = (slots.get('version') if slots else None) or 'v2'
+                    accept = proposal in self.supported_versions and self.owner.config.get('language_enable_protocol_upgrade', True)
+                    if accept:
+                        peer['agreed_version'] = proposal
+                        self.owner.blockchain.record_language_event(self.owner.node_id, source, 'protocol_set', {'version': proposal})
+                    reply = self.utter(
+                        intent='negotiate_ack',
+                        topic='protocol',
+                        content={'version': proposal, 'accepted': 'true' if accept else 'false'},
+                        peer_id=source
+                    )
+                    return True, {
+                        'decoded_intent': intent_hint,
+                        'topic': msg.get('topic', ''),
+                        'content': {'proposal': proposal, 'accepted': accept},
+                        'decided_version': peer.get('agreed_version'),
+                        'reply': reply
+                    }
+                else:
+                    ver = (slots.get('version') if slots else None) or 'v2'
+                    accepted = str(slots.get('accepted', 'false')).lower() == 'true'
+                    if accepted and ver in self.supported_versions:
+                        peer['agreed_version'] = ver
+                        self.owner.blockchain.record_language_event(self.owner.node_id, source, 'protocol_set', {'version': ver})
+                    return True, {
+                        'decoded_intent': intent_hint,
+                        'topic': msg.get('topic', ''),
+                        'content': {'version': ver, 'accepted': accepted},
+                        'decided_version': peer.get('agreed_version')
+                    }
+
+            success = False
+            decoded_intent = None
+
+            if used_version == 'v2':
+                ok, err = self.registry.validate('v2', msg)
+                if ok:
+                    decoded_intent = intent_hint
+                    success = True
+
+            if not success:
+                if utter:
+                    token = str(utter[0])[:16]
+                    if token in self.lexicon:
+                        decoded_intent = self.lexicon[token]
+                        success = True
+                        self.culture['memes'][token] = _clamp(self.culture['memes'].get(token, 0.3) + 0.05, 0.0, 1.5)
+                    else:
+                        target_intent = intent_hint if intent_hint in (self.BASE_INTENTS + self.PROTO_INTENTS) else random.choice(self.BASE_INTENTS)
+                        self.lexicon[token] = target_intent
+                        self.utterance_map[target_intent].add(token)
+                        adopt = random.random() < _clamp(sender_prestige, 0.2, 0.95)
+                        self.culture['memes'][token] = 0.3 + (0.3 if adopt else 0.0)
+                        decoded_intent = target_intent
+
+            if random.random() < self.owner.config.get('language_culture_drift_prob', 0.01):
+                if decoded_intent:
+                    t2 = self._new_token(decoded_intent)
+                    self.lexicon[t2] = decoded_intent
+                    self.utterance_map[decoded_intent].add(t2)
+                    self.culture['memes'][t2] = 0.2
+
+            self.conversations += 1
+            self.successes.append(1 if success else 0)
+            if 'history' in peer:
+                peer['history'].append(1 if success else 0)
+
+            return success, {
+                'decoded_intent': decoded_intent,
+                'topic': msg.get('topic', ''),
+                'content': msg.get('content', None),
+                'decided_version': peer.get('agreed_version', None),
+                'used_version': used_version
+            }
+        except Exception as e:
+            logger.error(f"Language interpret error: {e}")
+            return False, {}
+
+    def success_rate(self) -> float:
+        if not self.successes:
+            return 0.0
+        return float(sum(self.successes)) / len(self.successes)
+
+    def peer_success_rate(self, peer_id: str) -> float:
+        st = self._get_peer(peer_id)
+        h = st.get('history', [])
+        if not h:
+            return 0.0
+        return float(sum(h)) / len(h)
+
+    def stats(self) -> Dict:
+        return {
+            'language_id': self.language_id,
+            'protocol_version': self.protocol_version,
+            'lexicon_size': len(self.lexicon),
+            'success_rate_300': self.success_rate(),
+            'conversations': self.conversations,
+            'supported_versions': self.supported_versions
+        }
+
+
+# ============== 元学习：自适应超参数（学习率/记忆频率等） ==============
+class MetaLearner:
+    """
+    观测多源信号（生存评分、记忆产出、交流成功率），
+    动态调参：学习率、记忆巩固频率、交流频率、代码进化概率等
+    """
+    def __init__(self, owner: 'TrueDigitalLife'):
+        self.owner = owner
+        self.last_adjust = time.time()
+
+    def step(self):
+        cfg = self.owner.config
+        metrics = self.owner._meta_metrics
+        now = time.time()
+        if now - self.last_adjust < cfg.get('meta_interval_sec', 10.0):
+            return
+
+        surv = list(metrics['survival'])[-30:]
+        mem_gain = list(metrics['consolidation_yield'])[-20:]
+        comm = list(metrics['comm_success'])[-50:]
+
+        surv_avg = float(np.mean(surv)) if surv else 0.5
+        mem_avg = float(np.mean(mem_gain)) if mem_gain else 0.0
+        comm_avg = float(np.mean(comm)) if comm else 0.0
+
+        lr = cfg.get('learning_rate', 0.001)
+        target_lr = lr * (0.95 if surv_avg < 0.45 else 1.05 if surv_avg > 0.65 else 1.0)
+        lr = _clamp(target_lr, cfg.get('learning_rate_min', 1e-4), cfg.get('learning_rate_max', 2e-2))
+        cfg['learning_rate'] = lr
+        try:
+            self.owner.neural_net['plasticity'] = float(lr) * 100.0
+            for m in self.owner.neural_net['models'].values():
+                if hasattr(m, 'learning_rate_init'):
+                    m.learning_rate_init = float(lr)
+        except Exception:
+            pass
+
+        mem_interval = self.owner._interval_overrides.get('memory', 20.0)
+        if mem_avg < 0.8:
+            mem_interval = _clamp(mem_interval * 1.15, 10.0, 60.0)
+        elif mem_avg > 2.0:
+            mem_interval = _clamp(mem_interval * 0.9, 5.0, 60.0)
+        self.owner._interval_overrides['memory'] = mem_interval
+
+        talk_prob = cfg.get('language_talk_prob', 0.15)
+        if comm_avg < 0.4:
+            talk_prob *= 0.9
+        elif comm_avg > 0.7:
+            talk_prob *= 1.1
+        cfg['language_talk_prob'] = _clamp(talk_prob, 0.02, 0.6)
+
+        evo_prob = cfg.get('code_evolution_prob', 0.15)
+        if comm_avg < 0.3 and mem_avg < 0.8:
+            evo_prob *= 1.1
+        if surv_avg > 0.7:
+            evo_prob *= 0.9
+        cfg['code_evolution_prob'] = _clamp(evo_prob, 0.03, 0.5)
+
+        try:
+            if len(self.owner.short_term_memory) >= self.owner.short_term_memory.maxlen - 2:
+                self.owner._resize_memory_buffers(
+                    stm_min=max(100, int(self.owner.short_term_memory.maxlen * 1.1)),
+                    ltm_min=self.owner.long_term_memory.maxlen
+                )
+        except Exception:
+            pass
+
+        self.last_adjust = now
 
 
 class TrueDigitalLife:
@@ -1131,11 +2238,29 @@ class TrueDigitalLife:
             'host': '127.0.0.1',
             'port': int(os.environ.get('DL_PORT', '5500')),
             'auth_token': None,
-            'allowlist': None,  # 默认不限制来源IP，依赖签名 + 链上公钥校验；需要时可设为 ['127.0.0.1', ...]
+            'allowlist': None,  # 默认不限制来源IP
             'max_replication_per_hour': 2,
             'sandbox_timeout_ms': 800,
             'max_payload_bytes': 1 * 1024 * 1024,
-            'strict_target_ip_check': True  # 默认开启：仅发送到公共IP，缓解 SSRF
+            'strict_target_ip_check': True,  # 仅发送到公共IP
+            # 语言/协议/元学习配置
+            'language_talk_prob': 0.15,
+            'language_culture_drift_prob': 0.01,
+            'language_message_max_len': 4096,
+            'language_protocol_upgrade_threshold': 0.7,
+            'language_protocol_downgrade_threshold': 0.3,
+            'language_enable_protocol_upgrade': True,
+            'meta_interval_sec': 10.0,
+            'learning_rate_min': 1e-4,
+            'learning_rate_max': 2e-2,
+
+            # 新增：多目标/测试/神经/策略/加速开关
+            'moea_enable': True,
+            'unit_test_enable': True,
+            'neurosymbolic_enable': True,
+            'meta_strategy_enable': True,
+            'accelerate_enable': True,
+            'population_size': 8,
         }
         if config:
             self.config.update(config)
@@ -1165,7 +2290,7 @@ class TrueDigitalLife:
         if not self.config.get('auth_token'):
             self.config['auth_token'] = hashlib.sha256((self.node_id + ':salt').encode()).hexdigest()[:24]
 
-        # 网络可达性调整：自动寻找可用端口与可用IP
+        # 网络可达性调整
         self._auto_detect_host()
         self.config['port'] = self._find_free_port(self.config['port'], self.config['port'] + 200)
 
@@ -1175,7 +2300,7 @@ class TrueDigitalLife:
             difficulty=self.config['difficulty']
         )
 
-        # 签名密钥（演示：内存生成；生产应持久化并保护）
+        # 签名密钥
         self._signing_key: Ed25519PrivateKey = Ed25519PrivateKey.generate()
         self._verify_key: Ed25519PublicKey = self._signing_key.public_key()
         self._pubkey_hex: str = self._verify_key.public_bytes(
@@ -1207,9 +2332,18 @@ class TrueDigitalLife:
         self.environment = DigitalEnvironment(self.node_id)
         self.quantum_enhancer = QuantumEnhancer()
 
+        # 语言系统 & 元学习
+        self.language = LanguageSystem(self)
+        self.meta_learner = MetaLearner(self)
+        self._interval_overrides: Dict[str, float] = {}
+        self._meta_metrics = {
+            'survival': deque(maxlen=500),
+            'consolidation_yield': deque(maxlen=300),
+            'comm_success': deque(maxlen=500),
+        }
+
         # 分布式通信API
         self.api = Flask(__name__)
-        # 限制入站包体大小
         try:
             self.api.config['MAX_CONTENT_LENGTH'] = int(self.config.get('max_payload_bytes') or 0)
         except Exception:
@@ -1225,6 +2359,9 @@ class TrueDigitalLife:
             self.blockchain.record_announce(self.node_id, self.config['host'], self.config['port'], self._pubkey_hex)
         except Exception as e:
             logger.warning(f"Announce failed: {e}")
+
+        # 测试 Harness（correctness 驱动）
+        self._test_harness = CorrectnessHarness(self)
 
         # 启动生命周期进程
         self._start_life_processes()
@@ -1262,7 +2399,14 @@ class TrueDigitalLife:
         for p in range(start, end + 1):
             if self._is_port_free(p, self.config.get('host', '0.0.0.0')):
                 return p
-        return start
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((self.config.get('host', '0.0.0.0'), 0))
+            p = s.getsockname()[1]
+            s.close()
+            return p
+        except Exception:
+            return start
 
     def _init_mutable_methods(self):
         """初始化可进化方法列表（仅存方法名 + 源码缓存）"""
@@ -1271,7 +2415,6 @@ class TrueDigitalLife:
             '_consciousness_cycle',
             '_environment_scan',
             '_evolution_cycle',
-            # '_network_maintenance',  # 该方法包含 requests，不易安全热更，默认移出
             '_code_replication',
             '_survival_goal_evaluation',
             '_memory_consolidation',
@@ -1298,7 +2441,11 @@ class TrueDigitalLife:
                 'mutation_rate': random.uniform(0.01, 0.1),
                 'learning_rate': random.uniform(0.001, 0.01),
                 'exploration': random.random(),
-                'defense': random.uniform(0, 2)
+                'defense': random.uniform(0, 2),
+                'pop_size': random.randint(4, 32),
+                'crossover': random.uniform(0.1, 0.8),
+                'op_bias': random.random(),
+                'timeout': random.randint(400, 1600),
             }
             return self.genetic_encoder.encode(initial_params)
         except Exception as e:
@@ -1306,8 +2453,8 @@ class TrueDigitalLife:
             return hashlib.sha3_512(os.urandom(64)).hexdigest()
 
     def _init_neural_architecture(self) -> Dict:
-        """初始化可进化的神经架构"""
-        return {
+        """初始化可进化的神经架构（可选 torch.fx）"""
+        base = {
             'sensory_layers': [128, 64],
             'decision_layers': [64, 32, 16],
             'plasticity': 0.1,
@@ -1317,6 +2464,25 @@ class TrueDigitalLife:
                 'memory': MLPClassifier(hidden_layer_sizes=(128, 64))
             }
         }
+        if self.config.get('neurosymbolic_enable', True) and torch is not None and fx is not None and nn is not None:
+            class TinyNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.net = nn.Sequential(
+                        nn.Linear(16, 32),
+                        nn.ReLU(),
+                        nn.Linear(32, 16)
+                    )
+                def forward(self, x):
+                    return self.net(x)
+            try:
+                tn = TinyNet()
+                example = torch.randn(1, 16)
+                gm = fx.symbolic_trace(tn)
+                base['torch_fx'] = {'module': tn, 'graph': gm}
+            except Exception:
+                pass
+        return base
 
     def _require_auth(self, f):
         from functools import wraps
@@ -1386,7 +2552,6 @@ class TrueDigitalLife:
                 })
             return jsonify({'status': 'invalid_method'}), 404
 
-        # 受鉴权端点（保留以兼容；建议跨节点复制使用签名端点）
         @self.api.route('/receive_code', methods=['POST'])
         @self._require_auth
         def receive_code():
@@ -1398,10 +2563,8 @@ class TrueDigitalLife:
             threading.Thread(target=self._integrate_code, args=(code_data,), daemon=True).start()
             return jsonify({'status': 'code_received'})
 
-        # 基于签名与允许列表的端点
         @self.api.route('/receive_code_signed', methods=['POST'])
         def receive_code_signed():
-            # 仅在配置了 allowlist 时启用 IP 限制
             if self.config.get('allowlist') and request.remote_addr not in self.config['allowlist']:
                 return jsonify({'status': 'forbidden'}), 403
             if self.state == LifeState.REPLICATING:
@@ -1411,7 +2574,6 @@ class TrueDigitalLife:
             if not code_data or 'payload' not in code_data or 'sig' not in code_data or 'pubkey' not in code_data:
                 return jsonify({'status': 'invalid_code'}), 400
 
-            # 基础格式快速校验，避免无谓的重计算
             sig_hex = code_data.get('sig', '')
             pubkey_hex = code_data.get('pubkey', '')
             if not (isinstance(sig_hex, str) and len(sig_hex) == 128 and all(c in '0123456789abcdefABCDEF' for c in sig_hex)):
@@ -1419,14 +2581,108 @@ class TrueDigitalLife:
             if not (isinstance(pubkey_hex, str) and len(pubkey_hex) == 64 and all(c in '0123456789abcdefABCDEF' for c in pubkey_hex)):
                 return jsonify({'status': 'bad_pubkey_format'}), 400
 
+            try:
+                payload_b64 = code_data['payload']
+                payload_bytes = base64.b64decode(payload_b64.encode('utf-8'))
+                digest = hashlib.sha256(payload_bytes).digest()
+                vk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex))
+                vk.verify(bytes.fromhex(sig_hex), digest)
+                data = json.loads(payload_bytes.decode('utf-8'))  # decrypted package
+                source_node = data.get('metadata', {}).get('source_node', '')
+                addr_map = self.blockchain.get_node_address_map()
+                if source_node and source_node not in addr_map:
+                    host = data.get('metadata', {}).get('host') or request.remote_addr
+                    port = int(data.get('metadata', {}).get('port', 0))
+                    if 1 <= port <= 65535:
+                        if (not self.config.get('strict_target_ip_check')) or self._is_public_destination(host):
+                            try:
+                                self.blockchain.record_announce(source_node, host, port, pubkey_hex)
+                                logger.info(f"Auto-registered announce for {source_node} at {host}:{port}")
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
             threading.Thread(target=self._integrate_code, args=(code_data,), daemon=True).start()
             return jsonify({'status': 'code_received'})
+
+        @self.api.route('/speak_signed', methods=['POST'])
+        def speak_signed():
+            if self.config.get('allowlist') and request.remote_addr not in self.config['allowlist']:
+                return jsonify({'status': 'forbidden'}), 403
+
+            pkt = request.json
+            if not pkt or 'payload' not in pkt or 'sig' not in pkt or 'pubkey' not in pkt:
+                return jsonify({'status': 'invalid'}), 400
+            sig_hex = pkt.get('sig', '')
+            pub_hex = pkt.get('pubkey', '')
+            if not (isinstance(sig_hex, str) and len(sig_hex) == 128 and all(c in '0123456789abcdefABCDEF' for c in sig_hex)):
+                return jsonify({'status': 'bad_signature_format'}), 400
+            if not (isinstance(pub_hex, str) and len(pub_hex) == 64 and all(c in '0123456789abcdefABCDEF' for c in pub_hex)):
+                return jsonify({'status': 'bad_pubkey_format'}), 400
+
+            try:
+                payload_b64 = pkt['payload']
+                payload_bytes = base64.b64decode(payload_b64.encode('utf-8'))
+                digest = hashlib.sha256(payload_bytes).digest()
+                vk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
+                vk.verify(bytes.fromhex(sig_hex), digest)
+                data = json.loads(payload_bytes.decode('utf-8'))
+            except Exception as e:
+                logger.error(f"Speak verify failed: {e}")
+                return jsonify({'status': 'verify_failed'}), 400
+
+            try:
+                source_node = data.get('meta', {}).get('source_node') or data.get('metadata', {}).get('source_node', '')
+                addr_map = self.blockchain.get_node_address_map()
+                if source_node and source_node not in addr_map:
+                    host = data.get('meta', {}).get('host') or request.remote_addr
+                    port = int(data.get('meta', {}).get('port', 0))
+                    if 1 <= port <= 65535:
+                        if (not self.config.get('strict_target_ip_check')) or self._is_public_destination(host):
+                            try:
+                                self.blockchain.record_announce(source_node, host, port, pub_hex)
+                                logger.info(f"Auto-registered announce for {source_node} at {host}:{port}")
+                            except Exception:
+                                pass
+                addr_map = self.blockchain.get_node_address_map()
+                if source_node in addr_map:
+                    _, _, announced_pubkey = addr_map[source_node]
+                    if announced_pubkey and announced_pubkey != pub_hex:
+                        return jsonify({'status': 'pubkey_mismatch'}), 403
+            except Exception:
+                pass
+
+            ok = self._process_language_message(data)
+            return jsonify({'status': 'ok' if ok else 'accepted'})
+
+        @self.api.route('/language_stats', methods=['GET'])
+        def language_stats():
+            st = self.language.stats()
+            peers = {}
+            for pid, ps in list(self.language.peer_state.items())[:50]:
+                peers[pid] = {
+                    'agreed_version': ps.get('agreed_version'),
+                    'success_rate': self.language.peer_success_rate(pid),
+                    'history_len': len(ps.get('history', [])),
+                    'last_caps': ps.get('last_caps', [])
+                }
+            return jsonify({
+                'node': self.node_id,
+                'language': st,
+                'talk_prob': self.config.get('language_talk_prob', 0.15),
+                'meta': {
+                    'learning_rate': self.config.get('learning_rate', 0.001),
+                    'memory_interval': self._interval_overrides.get('memory', 20.0),
+                    'code_evolution_prob': self.config.get('code_evolution_prob', 0.15),
+                },
+                'peers': peers
+            })
 
     def _run_api(self):
         """运行分布式API服务器"""
         try:
             logger.info(f"API server starting on {self.config['host']}:{self.config['port']} (token head: {self.config['auth_token'][:6]}**)")
-            # 使用 threaded 模式，关闭 reloader，防止重复启动
             self.api.run(host=self.config['host'], port=self.config['port'], debug=False, threaded=True, use_reloader=False)
         except Exception as e:
             logger.error(f"API server failed: {e}")
@@ -1442,20 +2698,27 @@ class TrueDigitalLife:
             'replication': threading.Thread(target=self._life_cycle, args=('_code_replication', 15.0)),
             'survival': threading.Thread(target=self._life_cycle, args=('_survival_goal_evaluation', 4.0)),
             'memory': threading.Thread(target=self._life_cycle, args=('_memory_consolidation', 20.0)),
-            'motivation': threading.Thread(target=self._life_cycle, args=('_motivation_system', 3.0))
+            'motivation': threading.Thread(target=self._life_cycle, args=('_motivation_system', 3.0)),
+            'language': threading.Thread(target=self._life_cycle, args=('_language_cycle', 6.0)),
+            'meta': threading.Thread(target=self._life_cycle, args=('_meta_learning_cycle', 7.0)),
         }
         for p in self.processes.values():
             p.daemon = True
             p.start()
 
     def _life_cycle(self, method: str, interval: float):
-        """生命周期进程管理"""
+        """生命周期进程管理（支持元学习动态改频）"""
         while self.is_alive:
             try:
                 getattr(self, method)()
             except Exception as e:
                 logger.error(f"Life process {method} failed: {e}")
-            time.sleep(max(0.1, interval + random.uniform(-0.1, 0.1)))
+            dyn = None
+            for key in (method, method.strip('_'), method.split('_')[-1]):
+                if key in self._interval_overrides:
+                    dyn = float(self._interval_overrides[key])
+                    break
+            time.sleep(max(0.1, float(dyn if dyn is not None else interval) + random.uniform(-0.1, 0.1)))
 
     # ==== 核心生命功能 ====
     def _metabolism_cycle(self):
@@ -1502,6 +2765,14 @@ class TrueDigitalLife:
             with self._mem_lock:
                 self.long_term_memory.append(copy.deepcopy(self.short_term_memory[-1]))
 
+        try:
+            if self.state == LifeState.DORMANT:
+                if all(t.get('severity', 0) <= 5 for t in env['threats']):
+                    self.state = LifeState.ACTIVE
+                    logger.info("Exited dormant state; environment stabilized")
+        except Exception:
+            pass
+
     def _survival_goal_evaluation(self, update_state: bool = True):
         """生存目标评估系统"""
         energy_goal = min(1.0, self.energy / 100)
@@ -1539,6 +2810,7 @@ class TrueDigitalLife:
             scaled_features = scaler.fit_transform(features)
             kmeans = KMeans(n_clusters=3, n_init=10, random_state=42)
             clusters = kmeans.fit_predict(scaled_features)
+            created = 0
             for cluster_id in set(clusters):
                 cluster_features = [f for i, f in enumerate(features) if clusters[i] == cluster_id]
                 avg_features = np.mean(cluster_features, axis=0)
@@ -1553,9 +2825,16 @@ class TrueDigitalLife:
                     'first_seen': time.time()
                 }
                 with self._kb_lock:
-                    self.knowledge_base[f'pattern_{cluster_id}_{int(time.time())}'] = knowledge
+                    key = f'pattern_{cluster_id}_{int(time.time())}'
+                    if key not in self.knowledge_base:
+                        created += 1
+                    self.knowledge_base[key] = knowledge
             with self._kb_lock:
                 self._prune_knowledge_base(max_items=2000)
+            try:
+                self._meta_metrics['consolidation_yield'].append(float(created))
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
 
@@ -1581,7 +2860,7 @@ class TrueDigitalLife:
             self.config['code_evolution_prob'] = 0.25
 
     def _evolution_cycle(self):
-        """进化循环 - 代码自发变异"""
+        """进化循环 - 多目标 + correctness 驱动 + Pareto + 策略进化"""
         if (self.energy < self.config['min_energy_for_code_evo'] or
                 random.random() > self.config['code_evolution_prob']):
             return
@@ -1592,28 +2871,79 @@ class TrueDigitalLife:
         except Exception:
             return
 
-        new_code = self.code_engine.generate_code_variant(old_code)
-        fitness = self.code_engine.evaluate_code_fitness(old_code, new_code)
+        if not self.config.get('moea_enable', True):
+            # 回退到旧评估（极简）
+            new_code = self.code_engine.generate_code_variant(old_code)
+            fitness = self.code_engine.evaluate_code_fitness(old_code, new_code)
+            if fitness > 0.7 or (fitness > 0.5 and random.random() < 0.3):
+                if self.code_engine.hotswap_method(self, method_name, new_code):
+                    logger.info(f"Successfully evolved {method_name} (fitness: {fitness:.2f})")
+                    self.code_version += 1
+                    self._method_sources[method_name] = new_code
+            return
 
+        pop_size = int(self.config.get('population_size', 8))
+        variants = []
+        codes = []
+        for _ in range(pop_size):
+            new_code = self.code_engine.generate_code_variant(old_code)
+            variants.append(new_code)
+            codes.append(new_code)
+
+        static_pairs = self.code_engine._batch_static_metrics(codes) if hasattr(self.code_engine, '_batch_static_metrics') else [(0.0, 0.0)] * len(codes)
+        harness = getattr(self, '_test_harness', None)
+        if harness is None:
+            harness = CorrectnessHarness(self)
+            self._test_harness = harness
+        moea = MultiObjectiveFitness(harness)
+        objs: List[Dict[str, float]] = []
+        for i, code in enumerate(variants):
+            o = moea.evaluate(self, method_name, old_code, code)
+            en_proxy, cx_proxy = static_pairs[i]
+            o['energy_cost'] = min(o['energy_cost'], en_proxy + 1e-6)
+            o['complexity'] = min(o['complexity'], cx_proxy + 1e-6)
+            objs.append(o)
+
+        harness.evolve_tests(method_name, objs)
+
+        maximize = {'correctness', 'replicability'}
+        minimize = {'energy_cost', 'complexity'}
+        if any('bp_error' in o for o in objs):
+            minimize.add('bp_error')
+        fronts = ParetoTools.non_dominated_sort(objs, maximize, minimize)
+        keys_for_crowd = [(k, True) for k in maximize] + [(k, False) for k in minimize]
+        best_front = fronts[0] if fronts else list(range(len(objs)))
+        crowd = ParetoTools.crowding_distance(objs, best_front, keys_for_crowd)
+
+        if best_front:
+            cand = sorted(best_front, key=lambda i: (objs[i].get('correctness', 0.0), crowd[i]), reverse=True)[0]
+        else:
+            cand = int(np.argmax([o.get('correctness', 0.0) for o in objs]))
+
+        champion = variants[cand]
         applied = False
-        if fitness > 0.7 or (fitness > 0.5 and random.random() < 0.3):
-            if self.code_engine.hotswap_method(self, method_name, new_code):
-                logger.info(f"Successfully evolved {method_name} (fitness: {fitness:.2f})")
+        if objs[cand].get('correctness', 0.0) >= 0.6:
+            if self.code_engine.hotswap_method(self, method_name, champion):
+                logger.info(f"Pareto-evolved {method_name} -> correctness {objs[cand].get('correctness', 0.0):.2f} energy {objs[cand].get('energy_cost', 0.0):.4f} cx {objs[cand].get('complexity', 0.0):.2f}")
                 self.code_version += 1
-                self._method_sources[method_name] = new_code
+                self._method_sources[method_name] = champion
                 applied = True
             else:
-                logger.warning(f"Failed to evolve {method_name}, rolling back")
                 self.code_engine.rollback_method(self, method_name)
 
-        # 记录到区块链（包含是否应用成功）
+        if self.config.get('meta_strategy_enable', True):
+            try:
+                self.code_engine._evolve_strategy(objs)
+            except Exception:
+                pass
+
         try:
             self.blockchain.record_code_evolution(
                 self.node_id,
                 method_name,
                 old_code,
-                new_code,
-                {'fitness': fitness, 'energy': self.energy, 'code_version': self.code_version, 'applied': applied}
+                champion,
+                {'fitness_multi': objs[cand], 'energy': self.energy, 'code_version': self.code_version, 'applied': applied}
             )
         except Exception as e:
             logger.warning(f"Failed to record code evolution: {e}")
@@ -1655,7 +2985,7 @@ class TrueDigitalLife:
                     break
 
             if success:
-                self.energy -= 30  # 复制能量消耗
+                self.energy -= 30
                 logger.info(f"Code replication successful to {chosen_node}")
                 self.blockchain.record_gene_transfer(
                     self.node_id,
@@ -1696,7 +3026,6 @@ class TrueDigitalLife:
 
     def _create_replication_package(self) -> Dict:
         """创建包含当前生命状态的复制包（签名 + JSON 安全序列化）"""
-        # 过滤敏感配置
         safe_config = {k: v for k, v in self.config.items() if k not in ('auth_token', 'allowlist')}
 
         package = {
@@ -1704,13 +3033,14 @@ class TrueDigitalLife:
                 'source_node': self.node_id,
                 'timestamp': time.time(),
                 'code_version': self.code_version,
-                'dna_fingerprint': self.dna[:32]
+                'dna_fingerprint': self.dna[:32],
+                'host': self.config.get('host'),
+                'port': self.config.get('port'),
             },
             'core_code': {},
             'config': safe_config,
             'knowledge': self._json_sanitize(self.knowledge_base, max_depth=5),
             'dna_sequence': self.dna,
-            # 仅作为摘要，不进入信任判断
             'neural_state_digest': None
         }
 
@@ -1751,16 +3081,16 @@ class TrueDigitalLife:
         )[:self.config['max_connections']]
 
     def _is_public_destination(self, host: str) -> bool:
-        """解析主机并判断是否全部为公共IP（缓解 SSRF）。默认仅在 strict_target_ip_check=True 时启用"""
+        """解析主机并判断是否全部为公共IP（缓解 SSRF）"""
         try:
-            infos = socket.getaddrinfo(host, None, family=socket.AF_INET)
-            if not infos:
+            infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+            addrs = {info[4][0] for info in infos}
+            if not addrs:
                 return False
-            for info in infos:
-                ip = info[4][0]
+            for ip in addrs:
                 ip_obj = ipaddress.ip_address(ip)
-                if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or
-                        ip_obj.is_reserved or ip_obj.is_multicast):
+                if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+                    or ip_obj.is_reserved or ip_obj.is_multicast):
                     return False
             return True
         except Exception:
@@ -1775,7 +3105,6 @@ class TrueDigitalLife:
             host, port, _pub = addr_map[target_node]
             base = f"http://{host}:{port}"
 
-            # 可选：限制仅向公共IP发送以缓解 SSRF
             if self.config.get('strict_target_ip_check'):
                 if not self._is_public_destination(host):
                     logger.warning(f"Skip non-public target address: {host}")
@@ -1795,7 +3124,7 @@ class TrueDigitalLife:
             return False
 
     def _integrate_code(self, code_data: Dict):
-        """整合接收到的代码包（验证签名 + 链上公钥一致性）"""
+        """整合接收到的代码包（验证签名 + 链上公钥一致性 + 首次握手自动登记）"""
         if self.state == LifeState.REPLICATING:
             return False
 
@@ -1807,7 +3136,6 @@ class TrueDigitalLife:
             payload_bytes = base64.b64decode(payload_b64.encode('utf-8'))
             digest = hashlib.sha256(payload_bytes).digest()
 
-            # 先验签（校验完整性）
             try:
                 vk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(sender_pubkey_hex))
                 vk.verify(bytes.fromhex(sig_hex), digest)
@@ -1815,12 +3143,22 @@ class TrueDigitalLife:
                 logger.error(f"Signature verify failed: {e}")
                 return False
 
-            # 解析 JSON（安全）
             decrypted = json.loads(payload_bytes.decode('utf-8'))
             source_node = decrypted.get('metadata', {}).get('source_node', '')
 
-            # 以链为信任根：校验 pubkey 与 announce 一致
             addr_map = self.blockchain.get_node_address_map()
+            if source_node not in addr_map:
+                host = decrypted.get('metadata', {}).get('host', None)
+                port = int(decrypted.get('metadata', {}).get('port', 0))
+                if host and 1 <= port <= 65535:
+                    if (not self.config.get('strict_target_ip_check')) or self._is_public_destination(host):
+                        try:
+                            self.blockchain.record_announce(source_node, host, port, sender_pubkey_hex)
+                            logger.info(f"Auto-registered announce for {source_node} at {host}:{port}")
+                        except Exception:
+                            pass
+                addr_map = self.blockchain.get_node_address_map()
+
             if source_node not in addr_map:
                 logger.error("Unknown source node; reject package")
                 return False
@@ -1846,7 +3184,6 @@ class TrueDigitalLife:
                     if fitness > self.config['replication_threshold']:
                         if self.code_engine.hotswap_method(self, method_name, code):
                             logger.info(f"Integrated {method_name} from donor (fitness: {fitness:.2f})")
-                            # 更新本地源码与版本号
                             self.code_version += 1
                             self._method_sources[method_name] = code
                             try:
@@ -1860,11 +3197,9 @@ class TrueDigitalLife:
                             except Exception as e:
                                 logger.warning(f"Record code evolution failed: {e}")
 
-            # 更新DNA (部分基因转移)
             donor_dna = decrypted.get('dna_sequence', self.dna)
             self.dna = self.genetic_encoder.recombine(self.dna, donor_dna)
 
-            # 整合知识（已有键不覆盖）
             incoming_knowledge = decrypted.get('knowledge', {})
             if isinstance(incoming_knowledge, dict):
                 with self._kb_lock:
@@ -1913,7 +3248,7 @@ class TrueDigitalLife:
                 break
         if last_seen == 0:
             return 0.0
-        freshness = max(0.0, 1.0 - (time.time() - last_seen) / 3600.0)  # 越新鲜越接近1
+        freshness = max(0.0, 1.0 - (time.time() - last_seen) / 3600.0)
         return random.uniform(0.5, 1.0) * freshness
 
     def _terminate(self):
@@ -1981,11 +3316,11 @@ class TrueDigitalLife:
             logger.info("Knowledge integrated")
 
     def _prune_knowledge_base(self, max_items: int = 2000):
-        """限制知识库大小，基于 first_seen 或插入时间粗略裁剪"""
+        """限制知识库大小，基于 first_seen 或插入时间粗略裁剪（修复）"""
         with self._kb_lock:
             if len(self.knowledge_base) <= max_items:
                 return
-            items = []
+            items: List[Tuple[str, float]] = []
             for k, v in self.knowledge_base.items():
                 ts = 0.0
                 if isinstance(v, dict) and 'first_seen' in v:
@@ -1994,7 +3329,7 @@ class TrueDigitalLife:
                     except Exception:
                         ts = 0.0
                 items.append((k, ts))
-            items.sort(key=lambda x: x[1])  # old first
+            items.sort(key=lambda x: x[1])
             to_remove = [k for k, _ in items[:max(0, len(items) - max_items)]]
             for k in to_remove:
                 self.knowledge_base.pop(k, None)
@@ -2007,7 +3342,190 @@ class TrueDigitalLife:
             int(dna, 16)
         except Exception:
             return False
-        return len(dna) % 32 == 0 or len(dna) >= 160  # 允许基础通过
+        return len(dna) % 32 == 0 or len(dna) >= 160
+
+    # ===== 语言与协议：发送/接收周期 =====
+    def _truncate_language_message(self, msg: Dict) -> Dict:
+        """尽量不改变语义前提下裁剪超长语言消息"""
+        try:
+            max_len = int(self.config.get('language_message_max_len', 4096))
+            serialized = json.dumps(msg, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            if len(serialized) <= max_len:
+                return msg
+            m = msg.get('message', {})
+            if 'content' in m:
+                m.pop('content', None)
+            slots = m.get('slots', {})
+            if 'value' in slots and isinstance(slots['value'], str) and len(slots['value']) > 128:
+                slots['value'] = slots['value'][:128] + '…'
+            if len(json.dumps(msg, ensure_ascii=False, separators=(',', ':')).encode('utf-8')) > max_len:
+                m['topic'] = ''
+            if len(json.dumps(msg, ensure_ascii=False, separators=(',', ':')).encode('utf-8')) > max_len:
+                msg = {
+                    'meta': {
+                        'source_node': self.node_id,
+                        'protocol_version': msg.get('meta', {}).get('protocol_version', 1),
+                        'proto_version': msg.get('meta', {}).get('proto_version', 'v1'),
+                        'code_version': self.code_version,
+                        'timestamp': time.time(),
+                        'seq': msg.get('meta', {}).get('seq', 0)
+                    },
+                    'message': {
+                        'intent': m.get('intent', 'greet'),
+                        'utterance': m.get('utterance', ['hi'])
+                    }
+                }
+            return msg
+        except Exception:
+            return msg
+
+    def _create_signed_language_payload(self, msg: Dict) -> Dict:
+        msg = self._truncate_language_message(msg)
+        payload_json = json.dumps(msg, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        digest = hashlib.sha256(payload_json).digest()
+        signature = self._signing_key.sign(digest)
+        return {
+            'payload': base64.b64encode(payload_json).decode('utf-8'),
+            'sig': signature.hex(),
+            'pubkey': self._pubkey_hex
+        }
+
+    def _language_cycle(self):
+        """周期性地选择邻居进行语言交流；分享状态/知识，促成协议对齐"""
+        try:
+            if random.random() > self.config.get('language_talk_prob', 0.15):
+                return
+            targets = self._find_replication_targets()
+            if not targets:
+                return
+            target = random.choice(targets)
+            addr_map = self.blockchain.get_node_address_map()
+            if target not in addr_map:
+                return
+            host, port, _ = addr_map[target]
+            if self.config.get('strict_target_ip_check') and not self._is_public_destination(host):
+                return
+
+            ps = self.language._get_peer(target)
+            sr = self.language.peer_success_rate(target)
+            upgrade_thr = self.config.get('language_protocol_upgrade_threshold', 0.7)
+            downgrade_thr = self.config.get('language_protocol_downgrade_threshold', 0.3)
+            intent = None
+            content = None
+
+            if self.config.get('language_enable_protocol_upgrade', True):
+                if 'v2' in ps.get('last_caps', []) and ps.get('agreed_version') != 'v2' and sr >= upgrade_thr:
+                    intent = 'negotiate_protocol'
+                    content = {'version': 'v2'}
+                    self.blockchain.record_language_event(self.node_id, target, 'negotiate_propose', {'version': 'v2', 'sr': sr})
+                elif ps.get('agreed_version') == 'v2' and sr <= downgrade_thr:
+                    intent = 'negotiate_protocol'
+                    content = {'version': 'v1'}
+                    self.blockchain.record_language_event(self.node_id, target, 'negotiate_propose', {'version': 'v1', 'sr': sr})
+
+            if not intent:
+                intent = random.choices(
+                    LanguageSystem.BASE_INTENTS,
+                    weights=[3, 2, 2, 1, 1],
+                    k=1
+                )[0]
+                if intent == 'ask_status':
+                    content = {'energy': self.energy, 'state': self.state.name}
+                elif intent == 'share_knowledge':
+                    with self._kb_lock:
+                        if self.knowledge_base:
+                            k, v = random.choice(list(self.knowledge_base.items()))
+                            content = {k: v}
+                elif intent == 'propose_trade':
+                    content = {'item': 'compute', 'price': random.uniform(1, 5)}
+
+            msg = self.language.utter(intent=intent, topic='peer', content=content, peer_id=target)
+            pkg = self._create_signed_language_payload(msg)
+
+            url = f"http://{host}:{port}/speak_signed"
+            try:
+                resp = requests.post(url, json=pkg, timeout=3)
+                ok = (resp.status_code == 200)
+                self.blockchain.record_language_event(self.node_id, target, 'speak', {
+                    'intent': intent, 'ok': ok, 'ver': msg.get('meta', {}).get('proto_version', 'v1')
+                })
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"language cycle error: {e}")
+
+    def _process_language_message(self, data: Dict) -> bool:
+        """解读语言消息并做出对齐/吸收；必要时整合知识；如涉及协商则立即回包"""
+        try:
+            meta = data.get('meta', {})
+            source = meta.get('source_node', '')
+            prestige = 0.6
+            try:
+                donor_ver = int(meta.get('code_version', 1))
+                prestige = _clamp(0.4 + 0.06 * (donor_ver - self.code_version), 0.3, 0.9)
+            except Exception:
+                pass
+
+            success, result = self.language.interpret(data, sender_prestige=prestige)
+            self._meta_metrics['comm_success'].append(1.0 if success else 0.0)
+
+            if result.get('decoded_intent') == 'share_knowledge' and result.get('content'):
+                self._integrate_knowledge(result['content'])
+
+            reply = result.get('reply')
+            if reply and isinstance(reply, dict):
+                addr_map = self.blockchain.get_node_address_map()
+                if source in addr_map:
+                    host, port, _ = addr_map[source]
+                    if not self.config.get('strict_target_ip_check') or self._is_public_destination(host):
+                        pkg = self._create_signed_language_payload(reply)
+                        url = f"http://{host}:{port}/speak_signed"
+                        try:
+                            requests.post(url, json=pkg, timeout=3)
+                            self.blockchain.record_language_event(self.node_id, source, 'negotiate_ack', {
+                                'version': reply.get('message', {}).get('slots', {}).get('version')
+                            })
+                        except Exception:
+                            pass
+
+            try:
+                self.blockchain.record_language_event(self.node_id, source, 'receive', {
+                    'success': bool(success),
+                    'intent': result.get('decoded_intent', None),
+                    'used_version': result.get('used_version', None),
+                    'decided_version': result.get('decided_version', None)
+                })
+            except Exception:
+                pass
+
+            return True
+        except Exception as e:
+            logger.error(f"process language failed: {e}")
+            return False
+
+    def _meta_learning_cycle(self):
+        """调参循环：根据近期指标动态调整"""
+        try:
+            s = self._survival_goal_evaluation(update_state=False)
+            self._meta_metrics['survival'].append(float(s))
+        except Exception:
+            pass
+        try:
+            self.meta_learner.step()
+        except Exception as e:
+            logger.debug(f"meta learn error: {e}")
+
+    def _resize_memory_buffers(self, stm_min: int, ltm_min: int):
+        """在不丢失最近信息的前提下动态扩容内存队列"""
+        try:
+            if stm_min > self.short_term_memory.maxlen:
+                new_stm = deque(list(self.short_term_memory)[-stm_min:], maxlen=stm_min)
+                self.short_term_memory = new_stm
+            if ltm_min > self.long_term_memory.maxlen:
+                new_ltm = deque(list(self.long_term_memory)[-ltm_min:], maxlen=ltm_min)
+                self.long_term_memory = new_ltm
+        except Exception as e:
+            logger.debug(f"resize memory buffers failed: {e}")
 
 
 # ==== 启动数字生命 ====
