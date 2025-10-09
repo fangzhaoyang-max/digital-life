@@ -20,6 +20,7 @@ import uuid
 import linecache
 import base64
 import secrets
+import ipaddress
 from collections import deque
 from enum import Enum, auto
 from pathlib import Path
@@ -136,7 +137,8 @@ class DynamicFitnessEvaluator:
     def _functionality_score(self, original: str, mutated: str) -> float:
         """功能完整性评分"""
         try:
-            compile(mutated, '<string>', 'exec')
+            src = textwrap.dedent(mutated).lstrip()
+            compile(src, '<string>', 'exec')
             return 0.9 + 0.1 * random.random()  # 基本功能完整
         except Exception:
             return 0.1
@@ -151,7 +153,8 @@ class DynamicFitnessEvaluator:
     def _complexity_score(self, code: str) -> float:
         """复杂性评分"""
         try:
-            tree = ast.parse(code)
+            src = textwrap.dedent(code).lstrip()
+            tree = ast.parse(src)
             complexity = len(list(ast.walk(tree))) / 100  # 标准化
             return min(1.0, complexity)
         except Exception:
@@ -165,7 +168,8 @@ class DynamicFitnessEvaluator:
     def _replicability_score(self, code: str) -> float:
         """新增：代码可复制性评分"""
         try:
-            tree = ast.parse(code)
+            src = textwrap.dedent(code).lstrip()
+            tree = ast.parse(src)
             has_replication = any(
                 isinstance(node, ast.Call) and (
                     (isinstance(node.func, ast.Name) and 'replicate' in node.func.id) or
@@ -264,11 +268,13 @@ class SafeExec:
         'list': list, 'dict': dict, 'set': set, 'tuple': tuple,
         'print': print,
         'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
+        'TimeoutError': TimeoutError,
         'object': object,
     }
 
     @staticmethod
     def compile_and_load(src: str, func_name: str, filename: Optional[str] = None, extra_globals: Optional[Dict[str, Any]] = None):
+        src = textwrap.dedent(src).lstrip()
         tree = ast.parse(src)
         ASTSafetyChecker().visit(tree)
         ast.fix_missing_locations(tree)
@@ -551,7 +557,8 @@ class CodeEvolutionEngine:
     def generate_code_variant(self, original_code: str) -> str:
         """增强版代码变异生成（真正替换树）"""
         try:
-            tree = ast.parse(original_code)
+            src = textwrap.dedent(original_code).lstrip()
+            tree = ast.parse(src)
             tree = self._OperatorApplier(self).visit(tree)
             ast.fix_missing_locations(tree)
             if hasattr(ast, 'unparse'):
@@ -589,7 +596,8 @@ class CodeEvolutionEngine:
     def _calculate_complexity(self, code: str) -> float:
         """计算代码复杂度"""
         try:
-            tree = ast.parse(code)
+            src = textwrap.dedent(code).lstrip()
+            tree = ast.parse(src)
             complexity = 0
             for node in ast.walk(tree):
                 if isinstance(node, (ast.If, ast.For, ast.While, ast.FunctionDef)):
@@ -1065,9 +1073,11 @@ class TrueDigitalLife:
             'host': '127.0.0.1',
             'port': int(os.environ.get('DL_PORT', '5500')),
             'auth_token': None,
-            'allowlist': ['127.0.0.1'],
+            'allowlist': None,  # 默认不限制来源IP，依赖签名 + 链上公钥校验；需要时可设为 ['127.0.0.1', ...]
             'max_replication_per_hour': 2,
-            'sandbox_timeout_ms': 800
+            'sandbox_timeout_ms': 800,
+            'max_payload_bytes': 1 * 1024 * 1024,
+            'strict_target_ip_check': False  # 启用后，仅将复制包发送到公共IP，缓解 SSRF
         }
         if config:
             self.config.update(config)
@@ -1137,6 +1147,11 @@ class TrueDigitalLife:
 
         # 分布式通信API
         self.api = Flask(__name__)
+        # 限制入站包体大小
+        try:
+            self.api.config['MAX_CONTENT_LENGTH'] = int(self.config.get('max_payload_bytes') or 0)
+        except Exception:
+            self.api.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024
         self._init_api()
 
         # 启动 API
@@ -1203,7 +1218,8 @@ class TrueDigitalLife:
         self._method_sources: Dict[str, str] = {}
         for name in self.mutable_methods:
             try:
-                self._method_sources[name] = inspect.getsource(getattr(self, name))
+                src = inspect.getsource(getattr(self, name))
+                self._method_sources[name] = textwrap.dedent(src).lstrip()
             except Exception:
                 pass
 
@@ -1293,6 +1309,7 @@ class TrueDigitalLife:
             return jsonify({'status': 'no_knowledge'}), 400
 
         @self.api.route('/get_code', methods=['GET'])
+        @self._require_auth
         def get_code():
             method = request.args.get('method')
             if method in getattr(self, 'mutable_methods', []):
@@ -1322,6 +1339,7 @@ class TrueDigitalLife:
         # 基于签名与允许列表的端点
         @self.api.route('/receive_code_signed', methods=['POST'])
         def receive_code_signed():
+            # 仅在配置了 allowlist 时启用 IP 限制
             if self.config.get('allowlist') and request.remote_addr not in self.config['allowlist']:
                 return jsonify({'status': 'forbidden'}), 403
             if self.state == LifeState.REPLICATING:
@@ -1539,7 +1557,8 @@ class TrueDigitalLife:
             return
 
         try:
-            self.state = LifeState.REPLICATING
+            with self._lock:
+                self.state = LifeState.REPLICATING
             logger.info("Initiating code replication sequence...")
 
             replication_package = self._create_replication_package()
@@ -1574,7 +1593,8 @@ class TrueDigitalLife:
             logger.error(f"Replication error: {e}")
             self.stress = min(1.0, self.stress + 0.15)
         finally:
-            self.state = LifeState.ACTIVE
+            with self._lock:
+                self.state = LifeState.ACTIVE
 
     def _json_sanitize(self, obj: Any, max_depth: int = 4) -> Any:
         """尽量将对象转换为 JSON 可序列化形式，超出深度或不可序列化的做降级"""
@@ -1599,7 +1619,7 @@ class TrueDigitalLife:
     def _create_replication_package(self) -> Dict:
         """创建包含当前生命状态的复制包（签名 + JSON 安全序列化）"""
         # 过滤敏感配置
-        safe_config = {k: v for k, v in self.config.items() if k not in ('auth_token',)}
+        safe_config = {k: v for k, v in self.config.items() if k not in ('auth_token', 'allowlist')}
 
         package = {
             'metadata': {
@@ -1652,6 +1672,22 @@ class TrueDigitalLife:
             reverse=True
         )[:self.config['max_connections']]
 
+    def _is_public_destination(self, host: str) -> bool:
+        """解析主机并判断是否全部为公共IP（缓解 SSRF）。默认仅在 strict_target_ip_check=True 时启用"""
+        try:
+            infos = socket.getaddrinfo(host, None, family=socket.AF_INET)
+            if not infos:
+                return False
+            for info in infos:
+                ip = info[4][0]
+                ip_obj = ipaddress.ip_address(ip)
+                if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or
+                        ip_obj.is_reserved or ip_obj.is_multicast):
+                    return False
+            return True
+        except Exception:
+            return False
+
     def _send_replication_package(self, target_node: str, package: Dict) -> bool:
         """发送复制包到目标节点（只使用签名端点）"""
         try:
@@ -1661,7 +1697,12 @@ class TrueDigitalLife:
             host, port, _pub = addr_map[target_node]
             base = f"http://{host}:{port}"
 
-            # 直接使用签名端点（避免令牌不匹配问题）
+            # 可选：限制仅向公共IP发送以缓解 SSRF
+            if self.config.get('strict_target_ip_check'):
+                if not self._is_public_destination(host):
+                    logger.warning(f"Skip non-public target address: {host}")
+                    return False
+
             try:
                 response2 = requests.post(
                     f"{base}/receive_code_signed",
@@ -1714,7 +1755,8 @@ class TrueDigitalLife:
             if not self._should_accept_code(decrypted):
                 return False
 
-            self.state = LifeState.REPLICATING
+            with self._lock:
+                self.state = LifeState.REPLICATING
 
             for method_name, code in decrypted.get('core_code', {}).items():
                 if method_name in self.mutable_methods:
@@ -1754,7 +1796,8 @@ class TrueDigitalLife:
         except Exception as e:
             logger.error(f"Code integration failed: {e}")
         finally:
-            self.state = LifeState.ACTIVE
+            with self._lock:
+                self.state = LifeState.ACTIVE
         return False
 
     def _should_accept_code(self, package: Dict) -> bool:
