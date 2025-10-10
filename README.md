@@ -223,7 +223,7 @@ cd digital-life
 pip install -r requirements.txt
 
 # 在隔离环境中运行（推荐）
-python digital-life1.9.py
+python digital-life.py
 ```
 
 ### 安全运行建议
@@ -238,15 +238,14 @@ python digital-life1.9.py
 
 ```
 digital-life/
-├── digital-life1.9.py          # 最新版本主程序(建议运行)
-├── digital-life1.0-1.8.py      # 历史版本
-├── Digital Prokaryote 1.0.py   # 原核细胞版本(数字生命的升级版，未完成)
-├── 上帝.py                      # 创世程序
-├── 亚当.py                      # 第一个原始数字生命
-├── 夏娃.py                      # 第二个原始数字生命
-├── 蜂群.py                      # 变种版本
-├── README.md               # 详细说明（本文件）
-├── digital_life_bilingual_paper.md.md  # 技术论文
+├── digital-life.py                  # 最新版本主程序(建议运行)
+├── Digital-Prokaryote-1.0.py        # 原核细胞版本(数字生命的升级版，未完成)
+├── God.py                           # 创世程序
+├── Adam.py                          # 第一个原始数字生命
+├── Eve.py                           # 第二个原始数字生命
+├── Swarm.py                         # 变种版本
+├── README.md                        # 详细说明（本文件）
+├── digital_life_bilingual_paper.md  # 技术论文
 ```
 
 ## 💡 使用示例
@@ -572,7 +571,7 @@ I would like to thank the open-source community for providing the tools and libr
 
 ## 🔗 相关资源
 
-- [技术论文](digital_life_bilingual_paper.md.md) - 详细的技术文档
+- [技术论文](digital_life_bilingual_paper.md) - 详细的技术文档
 - [项目仓库](https://github.com/fangzhaoyang-max/digital-life) - 源代码和更新
 
 ---

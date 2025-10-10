@@ -4,8 +4,8 @@
 ## 摘要
 ## Abstract
 
-本文介绍了数字生命，一种自包含的自主系统，具备代码进化、繁殖、环境适应和实体间通信的能力。该系统以单个Python程序(digital-life1.9.py)的形式实现，通过遗传算法、神经网络和基于区块链的事件日志展示了涌现行为。该实现结合了量子增强随机性、多目标适应度评估和安全代码执行机制。实验结果表明，该系统能够成功进化自己的代码，通过与其他实例共享代码进行繁殖，并与同级开发通信协议。这项工作代表了创造真正自主数字生物的重要一步。
-This paper presents Digital Life, a self-contained autonomous system capable of code evolution, reproduction, environmental adaptation, and inter-entity communication. The system is implemented as a single Python program (digital-life1.9.py) that demonstrates emergent behaviors through genetic algorithms, neural networks, and blockchain-based event logging. The implementation incorporates quantum-enhanced randomness, multi-objective fitness evaluation, and secure code execution mechanisms. Experimental results show that the system can successfully evolve its own code, reproduce by sharing code with other instances, and develop communication protocols with peers. This work represents a significant step toward creating truly autonomous digital organisms.
+本文介绍了数字生命，一种自包含的自主系统，具备代码进化、繁殖、环境适应和实体间通信的能力。该系统以单个Python程序(digital-life.py)的形式实现，通过遗传算法、神经网络和基于区块链的事件日志展示了涌现行为。该实现结合了量子增强随机性、多目标适应度评估和安全代码执行机制。实验结果表明，该系统能够成功进化自己的代码，通过与其他实例共享代码进行繁殖，并与同级开发通信协议。这项工作代表了创造真正自主数字生物的重要一步。
+This paper presents Digital Life, a self-contained autonomous system capable of code evolution, reproduction, environmental adaptation, and inter-entity communication. The system is implemented as a single Python program (digital-life.py) that demonstrates emergent behaviors through genetic algorithms, neural networks, and blockchain-based event logging. The implementation incorporates quantum-enhanced randomness, multi-objective fitness evaluation, and secure code execution mechanisms. Experimental results show that the system can successfully evolve its own code, reproduce by sharing code with other instances, and develop communication protocols with peers. This work represents a significant step toward creating truly autonomous digital organisms.
 
 ## 1. 引言
 ## 1. Introduction
